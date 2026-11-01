@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+
+# Build outputs (regenerated during build)
+/dist/
+/build/
+/coverage/
+
+# Environment variables & API keys (NEVER commit secrets)
+.env
+.env.*
+!.env.example
+
+# Signing keys, keystores, passwords & private tokens (NEVER commit)
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+keystore.properties
+google-services-private.json
+service-account*.json
+
+# Android local build caches & machine-specific paths
+android/.gradle/
+android/build/
+android/app/build/
+android/capacitor-cordova-android-plugins/build/
+android/local.properties
+android/*.iml
+android/.idea/
+
+# Keep Gradle wrapper jar so ./gradlew works out-of-the-box on GitHub
+!android/gradle/wrapper/gradle-wrapper.jar
+
+# Logs, OS, debug screenshots & workspace temp metadata
+.aistudio/
+**/Screenshot_*.jpg
+**/Screenshot_*.png
+.DS_Store
+*.log
+npm-debug.log*

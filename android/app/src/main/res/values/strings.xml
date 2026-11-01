@@ -1,0 +1,8 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Janu AI</string>
+    <string name="title_activity_main">Janu AI</string>
+    <string name="package_name">com.poran.piyaai</string>
+    <string name="custom_url_scheme">com.poran.piyaai</string>
+    <string name="device_admin_description">Allows Janu AI to lock your phone screen only when you explicitly ask and confirm.</string>
+</resources>

@@ -1,0 +1,60 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --piya-bg: #050914;
+  --piya-surface: #0b1224;
+  --piya-surface-elevated: #111b33;
+  --piya-border: rgba(34, 211, 238, 0.18);
+  --piya-accent: #06b6d4;
+  --piya-accent-bright: #22d3ee;
+  --piya-accent-soft: rgba(6, 182, 212, 0.14);
+  --piya-accent-glow: rgba(6, 182, 212, 0.36);
+  --piya-on-accent: #041019;
+}
+
+html,
+body {
+  font-family: "Plus Jakarta Sans", "Noto Sans Bengali", "Noto Sans Devanagari", sans-serif;
+  background-color: var(--piya-bg);
+  color: #f1f5f9;
+  overscroll-behavior-y: none;
+}
+
+.font-display {
+  font-family: "Outfit", "Noto Sans Bengali", "Noto Sans Devanagari", sans-serif;
+}
+
+.font-mono-tabular {
+  font-family: "JetBrains Mono", monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Custom subtle scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.22);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.38);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

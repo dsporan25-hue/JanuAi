@@ -1,0 +1,6 @@
+{
+  "name": "Janu AI",
+  "description": "Janu AI — Personal AI voice assistant for Android featuring Bengali and Hindi female voice conversation, full-body anime character, and confirmable phone control actions.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

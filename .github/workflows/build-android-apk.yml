@@ -1,0 +1,77 @@
+name: Build Janu AI Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Janu AI Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Setup Java JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+          cache: "gradle"
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Typecheck & Build Frontend Bundle
+        run: |
+          npm run lint
+          npm run build
+
+      - name: Sync Web Bundle to Capacitor Android
+        run: npx cap sync android
+
+      - name: Grant Execute Permission to Gradle Wrapper
+        run: chmod +x android/gradlew
+
+      - name: Build Installable Debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug
+
+      - name: Build Signed Release APK (When Signing Secrets Are Configured)
+        if: ${{ secrets.PIYA_KEYSTORE_BASE64 != '' }}
+        working-directory: android
+        env:
+          PIYA_KEYSTORE_BASE64: ${{ secrets.PIYA_KEYSTORE_BASE64 }}
+          PIYA_KEYSTORE_PASSWORD: ${{ secrets.PIYA_KEYSTORE_PASSWORD }}
+          PIYA_KEY_ALIAS: ${{ secrets.PIYA_KEY_ALIAS }}
+          PIYA_KEY_PASSWORD: ${{ secrets.PIYA_KEY_PASSWORD }}
+        run: |
+          echo "$PIYA_KEYSTORE_BASE64" | base64 --decode > piya-release.jks
+          PIYA_KEYSTORE_PATH="$PWD/piya-release.jks" ./gradlew assembleRelease
+          rm -f piya-release.jks
+
+      - name: Collect Generated APK Files
+        run: |
+          mkdir -p apk-output
+          cp android/app/build/outputs/apk/debug/app-debug.apk apk-output/Janu-AI-debug.apk
+          if [ -f android/app/build/outputs/apk/release/app-release.apk ]; then
+            cp android/app/build/outputs/apk/release/app-release.apk apk-output/Janu-AI-signed-release.apk
+          fi
+
+      - name: Upload Janu AI APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Janu-AI-Android-APK
+          path: apk-output/*.apk
+          retention-days: 90
