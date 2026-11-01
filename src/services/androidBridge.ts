@@ -1,5 +1,29 @@
 import { Capacitor, registerPlugin } from "@capacitor/core";
-import type { BatteryInfo, ContactItem } from "../types/piya";
+import type { PluginListenerHandle } from "@capacitor/core";
+import type {
+  AlwaysActiveStage,
+  AlwaysActiveStatus,
+  BackgroundTurnRecord,
+  BatteryInfo,
+  ChatMessage,
+  ContactItem,
+  LanguageCode,
+  MemoryItem,
+} from "../types/piya";
+
+export const DEFAULT_CLOUD_BACKEND_URL =
+  "https://ais-pre-asnqfhdww664ezfv2ux5g7-331832155642.asia-southeast1.run.app";
+
+export interface NativeAlwaysActiveEvent {
+  eventType: "state" | "turn";
+  enabled?: boolean;
+  running?: boolean;
+  stage?: AlwaysActiveStage;
+  online?: boolean;
+  statusMessage?: string;
+  partialTranscript?: string;
+  turnJson?: string;
+}
 
 export interface PiyaDeviceControlPlugin {
   openApp(options: { packageName?: string; appName: string; fallbackUrl?: string }): Promise<{
@@ -25,6 +49,56 @@ export interface PiyaDeviceControlPlugin {
     enabled: boolean;
     supported: boolean;
   }>;
+
+  // Always Active Foreground Voice Service Bridge
+  getAlwaysActiveStatus(): Promise<{
+    enabled: boolean;
+    running: boolean;
+    stage: string;
+    wakeWord: string;
+    batteryOptimizationIgnored: boolean;
+    notificationPermissionGranted: boolean;
+    micPermissionGranted: boolean;
+    statusMessage: string;
+  }>;
+  setAlwaysActiveEnabled(options: {
+    enabled: boolean;
+    language: LanguageCode;
+    wakeWord: string;
+    speechSpeed: number;
+    voiceName: string;
+    backendUrl: string;
+    contactsJson?: string;
+    memoriesJson?: string;
+    historyJson?: string;
+  }): Promise<{
+    enabled: boolean;
+    running: boolean;
+    stage: string;
+    wakeWord: string;
+    batteryOptimizationIgnored: boolean;
+    notificationPermissionGranted: boolean;
+    micPermissionGranted: boolean;
+    statusMessage: string;
+  }>;
+  syncAssistantContext(options: {
+    language: LanguageCode;
+    wakeWord: string;
+    speechSpeed: number;
+    voiceName: string;
+    backendUrl: string;
+    contactsJson: string;
+    memoriesJson: string;
+    historyJson: string;
+  }): Promise<{ synced: boolean }>;
+  drainBackgroundTurns(): Promise<{ turnsJson: string }>;
+  yieldServiceMic(options: { pause: boolean }): Promise<{ paused: boolean }>;
+  requestIgnoreBatteryOptimizations(): Promise<{ batteryOptimizationIgnored: boolean }>;
+  openAppPermissionSettings(): Promise<{ launched: boolean }>;
+  addListener(
+    eventName: "alwaysActiveEvent",
+    listenerFunc: (event: NativeAlwaysActiveEvent) => void
+  ): Promise<PluginListenerHandle>;
 }
 
 export const PiyaNativePlugin = registerPlugin<PiyaDeviceControlPlugin>("PiyaDeviceControl");
@@ -36,6 +110,141 @@ export function isNativeAndroidRuntime(): boolean {
 export function isAndroidBrowser(): boolean {
   if (typeof navigator === "undefined") return false;
   return /android/i.test(navigator.userAgent);
+}
+
+export function getActiveBackendBaseUrl(): string {
+  const envUrl = (import.meta.env.VITE_API_BASE_URL || "").trim().replace(/\/+$/, "");
+  if (envUrl) return envUrl;
+  if (isNativeAndroidRuntime()) {
+    return DEFAULT_CLOUD_BACKEND_URL;
+  }
+  if (typeof window !== "undefined" && window.location.origin.startsWith("http")) {
+    if (!window.location.origin.includes("localhost") || window.location.port === "3000") {
+      return "";
+    }
+  }
+  return "";
+}
+
+export function getFullBackendOriginForNative(): string {
+  const envUrl = (import.meta.env.VITE_API_BASE_URL || "").trim().replace(/\/+$/, "");
+  if (envUrl) return envUrl;
+  if (
+    typeof window !== "undefined" &&
+    window.location.origin.startsWith("https://") &&
+    !window.location.origin.includes("localhost")
+  ) {
+    return window.location.origin;
+  }
+  return DEFAULT_CLOUD_BACKEND_URL;
+}
+
+export async function readNativeAlwaysActiveStatus(isOnline: boolean): Promise<AlwaysActiveStatus | null> {
+  if (!isNativeAndroidRuntime()) return null;
+  try {
+    const res = await PiyaNativePlugin.getAlwaysActiveStatus();
+    return {
+      enabled: Boolean(res.enabled),
+      running: Boolean(res.running),
+      stage: (res.stage as AlwaysActiveStage) || (res.enabled ? "wake_standby" : "off"),
+      mode: isOnline ? "online" : "offline",
+      wakeWord: res.wakeWord || "Janu",
+      batteryOptimizationIgnored: Boolean(res.batteryOptimizationIgnored),
+      notificationPermissionGranted: Boolean(res.notificationPermissionGranted),
+      micPermissionGranted: Boolean(res.micPermissionGranted),
+      statusMessage: res.statusMessage || "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function setNativeAlwaysActiveService(params: {
+  enabled: boolean;
+  language: LanguageCode;
+  wakeWord: string;
+  speechSpeed: number;
+  voiceName: string;
+  contacts: ContactItem[];
+  memories: MemoryItem[];
+  messages: ChatMessage[];
+  isOnline: boolean;
+}): Promise<AlwaysActiveStatus | null> {
+  if (!isNativeAndroidRuntime()) return null;
+  try {
+    const res = await PiyaNativePlugin.setAlwaysActiveEnabled({
+      enabled: params.enabled,
+      language: params.language,
+      wakeWord: params.wakeWord || "Janu",
+      speechSpeed: params.speechSpeed,
+      voiceName: params.voiceName,
+      backendUrl: getFullBackendOriginForNative(),
+      contactsJson: JSON.stringify(params.contacts.slice(0, 40)),
+      memoriesJson: JSON.stringify(params.memories.slice(0, 25)),
+      historyJson: JSON.stringify(
+        params.messages
+          .filter((m) => !m.isError)
+          .slice(-8)
+          .map((m) => ({ role: m.role, text: m.text }))
+      ),
+    });
+    return {
+      enabled: Boolean(res.enabled),
+      running: Boolean(res.running),
+      stage: (res.stage as AlwaysActiveStage) || (res.enabled ? "wake_standby" : "off"),
+      mode: params.isOnline ? "online" : "offline",
+      wakeWord: res.wakeWord || params.wakeWord || "Janu",
+      batteryOptimizationIgnored: Boolean(res.batteryOptimizationIgnored),
+      notificationPermissionGranted: Boolean(res.notificationPermissionGranted),
+      micPermissionGranted: Boolean(res.micPermissionGranted),
+      statusMessage: res.statusMessage || "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function syncNativeAssistantContext(params: {
+  language: LanguageCode;
+  wakeWord: string;
+  speechSpeed: number;
+  voiceName: string;
+  contacts: ContactItem[];
+  memories: MemoryItem[];
+  messages: ChatMessage[];
+}): Promise<void> {
+  if (!isNativeAndroidRuntime()) return;
+  try {
+    await PiyaNativePlugin.syncAssistantContext({
+      language: params.language,
+      wakeWord: params.wakeWord || "Janu",
+      speechSpeed: params.speechSpeed,
+      voiceName: params.voiceName,
+      backendUrl: getFullBackendOriginForNative(),
+      contactsJson: JSON.stringify(params.contacts.slice(0, 40)),
+      memoriesJson: JSON.stringify(params.memories.slice(0, 25)),
+      historyJson: JSON.stringify(
+        params.messages
+          .filter((m) => !m.isError)
+          .slice(-8)
+          .map((m) => ({ role: m.role, text: m.text }))
+      ),
+    });
+  } catch {
+    // Ignore sync errors on non-native environments
+  }
+}
+
+export async function drainNativeBackgroundTurns(): Promise<BackgroundTurnRecord[]> {
+  if (!isNativeAndroidRuntime()) return [];
+  try {
+    const res = await PiyaNativePlugin.drainBackgroundTurns();
+    if (!res.turnsJson) return [];
+    const parsed = JSON.parse(res.turnsJson) as BackgroundTurnRecord[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 const KNOWN_ANDROID_APPS: Record<
@@ -193,9 +402,6 @@ export function matchContactsFromDirectory(
   });
 }
 
-/**
- * Reads live battery status via Web Battery Status API (supported in Android WebView & Chrome).
- */
 export async function readLiveBatteryStatus(): Promise<BatteryInfo> {
   try {
     const nav = navigator as Navigator & {
@@ -218,7 +424,6 @@ export async function readLiveBatteryStatus(): Promise<BatteryInfo> {
   }
 }
 
-// Hardware Torch / Flashlight state via MediaDevices ImageCapture track constraints or Capacitor
 let activeTorchStream: MediaStream | null = null;
 
 export async function setHardwareFlashlight(enable: boolean): Promise<{
@@ -403,9 +608,6 @@ export async function executeSystemSettingsOpen(
   };
 }
 
-/**
- * Uses the W3C / Android Contact Picker API (`navigator.contacts.select`) when available on Android Chrome/WebView.
- */
 export async function pickNativeAndroidContacts(): Promise<{
   supported: boolean;
   contacts: ContactItem[];
@@ -456,12 +658,11 @@ export async function pickNativeAndroidContacts(): Promise<{
   }
 }
 
-/**
- * Plays a gentle dual-tone synthesized alarm chime via Web Audio API when an in-app alarm triggers.
- */
 export function playAlarmChime(): void {
   try {
-    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     const ctx = new AudioCtx();
     const notes = [523.25, 659.25, 783.99, 1046.5];
     notes.forEach((freq, idx) => {
@@ -480,5 +681,31 @@ export function playAlarmChime(): void {
     });
   } catch {
     // Ignore audio context restriction if page had no prior gesture
+  }
+}
+
+export function playWakeActivationCue(): void {
+  try {
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const ctx = new AudioCtx();
+    const tones = [660, 880];
+    tones.forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      const start = ctx.currentTime + i * 0.09;
+      gain.gain.setValueAtTime(0.001, start);
+      gain.gain.exponentialRampToValueAtTime(0.11, start + 0.025);
+      gain.gain.exponentialRampToValueAtTime(0.001, start + 0.14);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + 0.16);
+    });
+  } catch {
+    // Ignore
   }
 }

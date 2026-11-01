@@ -1,4 +1,4 @@
-export type LanguageCode = "bn" | "hi";
+export type LanguageCode = "bn" | "hi" | "en";
 
 export type ThemeId =
   | "classic-cyan"
@@ -12,6 +12,28 @@ export type AssistantVisualState = "idle" | "listening" | "thinking" | "speaking
 export type VoiceOption = "Kore" | "Zephyr" | "PiyaSweet" | "PiyaCalm";
 
 export type CharacterRenderMode = "3d-rig" | "studio-render";
+
+export type AlwaysActiveStage =
+  | "off"
+  | "wake_standby"
+  | "capturing_command"
+  | "processing"
+  | "speaking"
+  | "paused_permission"
+  | "recovering";
+
+export interface AlwaysActiveStatus {
+  enabled: boolean;
+  running: boolean;
+  stage: AlwaysActiveStage;
+  mode: "online" | "offline";
+  wakeWord: string;
+  batteryOptimizationIgnored: boolean;
+  notificationPermissionGranted: boolean;
+  micPermissionGranted: boolean;
+  statusMessage: string;
+  lastTranscript?: string;
+}
 
 export interface ThemeDefinition {
   id: ThemeId;
@@ -119,6 +141,8 @@ export interface AppSettings {
   memoryEnabled: boolean;
   autoConfirmMemory: boolean;
   preferNeuralTts: boolean;
+  alwaysActiveVoice: boolean;
+  wakeWord: string;
 }
 
 export interface SystemConnectionStatus {
@@ -134,4 +158,18 @@ export interface BatteryInfo {
   supported: boolean;
   level: number | null;
   charging: boolean | null;
+}
+
+export interface BackgroundTurnRecord {
+  id: string;
+  userText: string;
+  assistantText: string;
+  language: LanguageCode;
+  timestamp: string;
+  actionBadge?: string;
+  noteTitle?: string;
+  noteContent?: string;
+  alarmHour?: number;
+  alarmMinute?: number;
+  alarmLabel?: string;
 }

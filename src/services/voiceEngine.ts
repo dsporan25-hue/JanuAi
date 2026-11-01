@@ -1,4 +1,6 @@
-import type { LanguageCode, VoiceOption } from "../types/piya";
+import type { AlwaysActiveStage, LanguageCode, VoiceOption } from "../types/piya";
+import { extractWakeWordAndCommand } from "../constants/themesAndCopy";
+import { getActiveBackendBaseUrl, playWakeActivationCue } from "./androidBridge";
 
 export type MicPermissionState = "prompt" | "granted" | "denied" | "unsupported";
 
@@ -42,11 +44,21 @@ interface SpeechRecognitionInstance {
   abort: () => void;
 }
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/+$/, "");
+function getSpeechRecConstructor(): (new () => SpeechRecognitionInstance) | null {
+  if (typeof window === "undefined") return null;
+  return (
+    (window as unknown as { SpeechRecognition?: new () => SpeechRecognitionInstance })
+      .SpeechRecognition ||
+    (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognitionInstance })
+      .webkitSpeechRecognition ||
+    null
+  );
+}
 
 export function resolveApiUrl(path: string): string {
   if (path.startsWith("http://") || path.startsWith("https://")) return path;
-  return `${API_BASE_URL}${path.startsWith("/") ? path : `/${path}`}`;
+  const base = getActiveBackendBaseUrl();
+  return `${base}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
 /**
@@ -170,6 +182,12 @@ function isAndroidEnvironment(): boolean {
   return /android/i.test(navigator.userAgent);
 }
 
+function mapLangToBcp47(lang: LanguageCode): string {
+  if (lang === "hi") return "hi-IN";
+  if (lang === "en") return "en-US";
+  return "bn-BD";
+}
+
 export class PiyaVoiceEngine {
   private mediaStream: MediaStream | null = null;
   private mediaRecorder: MediaRecorder | null = null;
@@ -193,10 +211,6 @@ export class PiyaVoiceEngine {
   private speechDetectedAt = 0;
   private lastLoudFrameAt = 0;
 
-  /**
-   * Unlocks Web Audio & pre-loads system TTS voices synchronously during a user tap gesture
-   * so mobile Android browsers never block voice playback after async API responses.
-   */
   public unlockAudioOnGesture(): void {
     try {
       const AudioCtx =
@@ -251,12 +265,16 @@ export class PiyaVoiceEngine {
         throw new Error(
           options.language === "hi"
             ? "माइक्रोफ़ोन की अनुमति नहीं मिली। कृपया ब्राउज़र में Microphone Allow करें।"
+            : options.language === "en"
+            ? "Microphone permission denied. Please allow Microphone access in settings."
             : "মাইক্রোফোন অনুমতি পাওয়া যায়নি। অনুগ্রহ করে ব্রাউজারে Microphone Allow করুন।"
         );
       }
       throw new Error(
         options.language === "hi"
           ? "माइक्रोफ़ोन चालू नहीं हो सका। कृपया फिर से प्रयास करें।"
+          : options.language === "en"
+          ? "Could not start microphone. Please try again."
           : "মাইক্রোফোন চালু করা যায়নি। অনুগ্রহ করে আবার চেষ্টা করুন।"
       );
     }
@@ -269,7 +287,6 @@ export class PiyaVoiceEngine {
     this.speechDetectedAt = 0;
     this.lastLoudFrameAt = performance.now();
 
-    // Time-domain RMS voice activity detector (works accurately across Android & Desktop mics)
     const AudioCtx =
       window.AudioContext ||
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -312,7 +329,6 @@ export class PiyaVoiceEngine {
         noiseFloor = noiseFloor * 0.94 + rms * 0.06;
       }
 
-      // Fast auto-finish: after >= 300ms of speech followed by 950ms pause, or 14s max cap
       if (
         (this.speechDetectedAt > 0 &&
           now - this.speechDetectedAt > 300 &&
@@ -327,7 +343,6 @@ export class PiyaVoiceEngine {
     };
     this.inputMonitorFrame = requestAnimationFrame(monitorInput);
 
-    // Compact 24kbps speech encoding for fast mobile 4G upload
     const preferredMime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
       ? "audio/webm;codecs=opus"
       : MediaRecorder.isTypeSupported("audio/webm")
@@ -353,19 +368,13 @@ export class PiyaVoiceEngine {
     };
     this.mediaRecorder.start(150);
 
-    // IMPORTANT: Never start webkitSpeechRecognition alongside MediaRecorder on Android!
-    // On Android OS, SpeechRecognition steals exclusive hardware mic access and mutes MediaRecorder.
+    // Never run webkitSpeechRecognition simultaneously with MediaRecorder on Android OS
     if (!isAndroidEnvironment()) {
-      const SpeechRecConstructor =
-        (window as unknown as { SpeechRecognition?: new () => SpeechRecognitionInstance })
-          .SpeechRecognition ||
-        (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognitionInstance })
-          .webkitSpeechRecognition;
-
+      const SpeechRecConstructor = getSpeechRecConstructor();
       if (SpeechRecConstructor) {
         try {
           const rec = new SpeechRecConstructor();
-          rec.lang = options.language === "hi" ? "hi-IN" : "bn-BD";
+          rec.lang = mapLangToBcp47(options.language);
           rec.continuous = true;
           rec.interimResults = true;
           rec.onresult = (event: SpeechRecognitionEventLike) => {
@@ -518,12 +527,17 @@ export class PiyaVoiceEngine {
         await this.playBase64AudioViaContext(options.preloadedAudioBase64, options);
         return;
       } catch {
-        // Fall through to fresh /api/assistant/tts request
+        // Fall through
       }
     }
 
-    // 2. Fetch 100% Female Audio from Backend ('fast' ~200ms Female MP3 or 'studio' Gemini Female Kore/Zephyr)
-    // Never use Android's default window.speechSynthesis here because Android OS defaults to a male voice!
+    // 2. When offline, use Female-Filtered Local Synthesis Fallback so Offline Mode speaks aloud
+    if (typeof navigator !== "undefined" && !navigator.onLine) {
+      await this.speakOfflineFemaleFallback(cleanText, options);
+      return;
+    }
+
+    // 3. Online: Fetch 100% Female Audio from Backend
     const abortCtrl = new AbortController();
     this.activeTtsAbort = abortCtrl;
     try {
@@ -557,9 +571,84 @@ export class PiyaVoiceEngine {
         options.onEnd?.();
         return;
       }
+      // If network dropped mid-turn, attempt offline female voice fallback before failing
+      if (typeof navigator !== "undefined" && !navigator.onLine) {
+        await this.speakOfflineFemaleFallback(cleanText, options);
+        return;
+      }
       options.onError?.(err instanceof Error ? err.message : "ভয়েস প্লেব্যাকে সমস্যা হয়েছে।");
       options.onEnd?.();
     }
+  }
+
+  private speakOfflineFemaleFallback(
+    cleanText: string,
+    options: {
+      language: LanguageCode;
+      speechSpeed: number;
+      onStart?: () => void;
+      onLipSyncFrame?: (frame: LipSyncFrame) => void;
+      onEnd?: () => void;
+    }
+  ): Promise<void> {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      options.onEnd?.();
+      return Promise.resolve();
+    }
+
+    return new Promise<void>((resolve) => {
+      try {
+        window.speechSynthesis.cancel();
+        const utter = new SpeechSynthesisUtterance(cleanText);
+        utter.lang = mapLangToBcp47(options.language);
+        utter.rate = Math.min(1.35, Math.max(0.8, options.speechSpeed || 1.0));
+        utter.pitch = 1.18;
+
+        const voices = window.speechSynthesis.getVoices();
+        const langPrefix = options.language;
+        const femaleCandidates = voices.filter((v) => {
+          const vName = v.name.toLowerCase();
+          if (vName.includes("male") && !vName.includes("female")) return false;
+          return (
+            v.lang.toLowerCase().startsWith(langPrefix) &&
+            (vName.includes("female") ||
+              vName.includes("kalpana") ||
+              vName.includes("heera") ||
+              vName.includes("zira") ||
+              vName.includes("samantha") ||
+              vName.includes("google") ||
+              !vName.includes("hemant"))
+          );
+        });
+        if (femaleCandidates.length > 0) {
+          utter.voice = femaleCandidates[0];
+        }
+
+        const finish = () => {
+          window.clearInterval(this.synthFallbackInterval);
+          options.onLipSyncFrame?.({ mouthOpen: 0, mouthSpread: 0.35, energy: 0 });
+          options.onEnd?.();
+          resolve();
+        };
+
+        utter.onstart = () => {
+          options.onStart?.();
+          let t = 0;
+          this.synthFallbackInterval = window.setInterval(() => {
+            t += 0.35;
+            const open = Math.abs(Math.sin(t)) * 0.65 + 0.1;
+            options.onLipSyncFrame?.({ mouthOpen: open, mouthSpread: 0.5, energy: open * 0.8 });
+          }, 60);
+        };
+        utter.onend = finish;
+        utter.onerror = finish;
+
+        window.speechSynthesis.speak(utter);
+      } catch {
+        options.onEnd?.();
+        resolve();
+      }
+    });
   }
 
   private async playBase64AudioViaContext(
@@ -598,7 +687,6 @@ export class PiyaVoiceEngine {
     const bufferSource = ctx.createBufferSource();
     bufferSource.buffer = decodedBuffer;
 
-    // Subtle feminine voice persona tuning (all 4 remain sweet, clear female voices)
     let rateMultiplier = 1.0;
     let detuneCents = 0;
     if (!options.preferNeuralTts) {
@@ -702,5 +790,236 @@ export class PiyaVoiceEngine {
         // Ignore
       }
     }
+  }
+}
+
+/**
+ * Web / Browser Local Wake-Word Always-Active Controller.
+ * Used when running in Web Browser / Preview (while Native Android APK uses JanuAlwaysActiveService).
+ * Privacy-first: Wake-Word matching runs locally via SpeechRecognition without uploading standby audio!
+ */
+export class WebAlwaysActiveWakeController {
+  private active = false;
+  private suspendedForTurn = false;
+  private awaitingCommandAfterWake = false;
+  private rec: SpeechRecognitionInstance | null = null;
+  private restartTimer = 0;
+  private commandTimeoutTimer = 0;
+
+  private language: LanguageCode = "bn";
+  private wakeWord = "Janu";
+
+  private onStageChange?: (stage: AlwaysActiveStage, statusMessage: string, interim?: string) => void;
+  private onWakeCommand?: (command: string) => void;
+  private onPermissionRevoked?: () => void;
+
+  public configure(params: {
+    language: LanguageCode;
+    wakeWord: string;
+    onStageChange: (stage: AlwaysActiveStage, statusMessage: string, interim?: string) => void;
+    onWakeCommand: (command: string) => void;
+    onPermissionRevoked: () => void;
+  }): void {
+    const langChanged = this.language !== params.language;
+    this.language = params.language;
+    this.wakeWord = params.wakeWord || "Janu";
+    this.onStageChange = params.onStageChange;
+    this.onWakeCommand = params.onWakeCommand;
+    this.onPermissionRevoked = params.onPermissionRevoked;
+
+    if (this.active && langChanged && !this.suspendedForTurn) {
+      this.restartRecognizerSoon(150);
+    }
+  }
+
+  public isSupported(): boolean {
+    return Boolean(getSpeechRecConstructor());
+  }
+
+  public start(): void {
+    if (this.active) return;
+    this.active = true;
+    this.suspendedForTurn = false;
+    this.awaitingCommandAfterWake = false;
+    this.startCycle();
+  }
+
+  public stop(): void {
+    this.active = false;
+    this.suspendedForTurn = false;
+    this.awaitingCommandAfterWake = false;
+    window.clearTimeout(this.restartTimer);
+    window.clearTimeout(this.commandTimeoutTimer);
+    this.destroyRec();
+    this.onStageChange?.("off", "");
+  }
+
+  public pauseForTurnProcessing(): void {
+    if (!this.active) return;
+    this.suspendedForTurn = true;
+    this.awaitingCommandAfterWake = false;
+    window.clearTimeout(this.restartTimer);
+    window.clearTimeout(this.commandTimeoutTimer);
+    this.destroyRec();
+  }
+
+  public resumeWakeStandby(): void {
+    if (!this.active) return;
+    this.suspendedForTurn = false;
+    this.awaitingCommandAfterWake = false;
+    this.onStageChange?.("wake_standby", this.standbyText());
+    this.restartRecognizerSoon(260);
+  }
+
+  private standbyText(): string {
+    if (this.language === "hi") {
+      return `हमेशा सक्रिय · 'Hey ${this.wakeWord}' या 'जानू' बोलें`;
+    }
+    if (this.language === "en") {
+      return `Always Active · Say 'Hey ${this.wakeWord}'`;
+    }
+    return `সর্বদা সক্রিয় · 'Hey ${this.wakeWord}' বা 'জানু' বলুন`;
+  }
+
+  private destroyRec(): void {
+    if (this.rec) {
+      const r = this.rec;
+      this.rec = null;
+      r.onresult = null;
+      r.onerror = null;
+      r.onend = null;
+      try {
+        r.abort();
+      } catch {
+        // Ignore
+      }
+    }
+  }
+
+  private restartRecognizerSoon(delayMs: number): void {
+    window.clearTimeout(this.restartTimer);
+    if (!this.active || this.suspendedForTurn) return;
+    this.restartTimer = window.setTimeout(() => {
+      this.startCycle();
+    }, delayMs);
+  }
+
+  private startCycle(): void {
+    if (!this.active || this.suspendedForTurn) return;
+
+    const SpeechRec = getSpeechRecConstructor();
+    if (!SpeechRec) {
+      this.onStageChange?.(
+        "recovering",
+        this.language === "bn"
+          ? "এই ব্রাউজারে লোকাল Wake Word সাপোর্ট নেই — Chrome বা Android APK ব্যবহার করুন"
+          : "Wake Word requires Chrome or the Janu AI Android APK"
+      );
+      return;
+    }
+
+    this.destroyRec();
+
+    try {
+      const instance = new SpeechRec();
+      instance.lang = mapLangToBcp47(this.language);
+      instance.continuous = true;
+      instance.interimResults = true;
+
+      instance.onresult = (event: SpeechRecognitionEventLike) => {
+        if (!this.active || this.suspendedForTurn) return;
+
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const res = event.results[i];
+          const text = (res[0]?.transcript || "").trim();
+          if (!text) continue;
+
+          if (!res.isFinal) {
+            if (this.awaitingCommandAfterWake) {
+              this.onStageChange?.("capturing_command", "জানু আপনার নির্দেশ শুনছে...", text);
+            }
+            continue;
+          }
+
+          // Finalized utterance segment
+          if (this.awaitingCommandAfterWake) {
+            this.awaitingCommandAfterWake = false;
+            window.clearTimeout(this.commandTimeoutTimer);
+            const stripWake = extractWakeWordAndCommand(text, this.wakeWord);
+            const finalCmd =
+              stripWake.matched && stripWake.inlineCommand ? stripWake.inlineCommand : text;
+
+            if (stripWake.matched && !stripWake.inlineCommand) {
+              this.awaitingCommandAfterWake = true;
+              this.armCommandTimeout();
+              return;
+            }
+
+            this.pauseForTurnProcessing();
+            this.onWakeCommand?.(finalCmd);
+            return;
+          }
+
+          const wakeCheck = extractWakeWordAndCommand(text, this.wakeWord);
+          if (wakeCheck.matched) {
+            playWakeActivationCue();
+            if (wakeCheck.inlineCommand) {
+              this.pauseForTurnProcessing();
+              this.onWakeCommand?.(wakeCheck.inlineCommand);
+              return;
+            }
+            this.awaitingCommandAfterWake = true;
+            this.onStageChange?.(
+              "capturing_command",
+              this.language === "hi"
+                ? "जी बताइए, जानू सुन रही है..."
+                : this.language === "en"
+                ? "Yes, Janu is listening for your command..."
+                : "জি বলুন, জানু আপনার নির্দেশ শুনছে..."
+            );
+            this.armCommandTimeout();
+          }
+        }
+      };
+
+      instance.onerror = (ev: { error: string }) => {
+        if (!this.active || this.suspendedForTurn) return;
+        if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
+          this.onStageChange?.(
+            "paused_permission",
+            this.language === "bn"
+              ? "মাইক্রোফোন অনুমতি বাতিল হয়েছে — পুনরায় Allow করুন"
+              : "Microphone permission required"
+          );
+          this.onPermissionRevoked?.();
+          return;
+        }
+        this.restartRecognizerSoon(500);
+      };
+
+      instance.onend = () => {
+        if (!this.active || this.suspendedForTurn) return;
+        this.restartRecognizerSoon(220);
+      };
+
+      instance.start();
+      this.rec = instance;
+      this.onStageChange?.(
+        this.awaitingCommandAfterWake ? "capturing_command" : "wake_standby",
+        this.awaitingCommandAfterWake ? "জানু আপনার নির্দেশ শুনছে..." : this.standbyText()
+      );
+    } catch {
+      this.restartRecognizerSoon(900);
+    }
+  }
+
+  private armCommandTimeout(): void {
+    window.clearTimeout(this.commandTimeoutTimer);
+    this.commandTimeoutTimer = window.setTimeout(() => {
+      if (this.active && !this.suspendedForTurn && this.awaitingCommandAfterWake) {
+        this.awaitingCommandAfterWake = false;
+        this.onStageChange?.("wake_standby", this.standbyText());
+      }
+    }, 9500);
   }
 }

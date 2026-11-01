@@ -98,40 +98,50 @@ export const VOICE_OPTIONS: Array<{
   label: string;
   bnLabel: string;
   hiLabel: string;
+  enLabel: string;
   bnDesc: string;
   hiDesc: string;
+  enDesc: string;
 }> = [
   {
     id: "Kore",
     label: "Janu Natural (Female)",
     bnLabel: "জানু ন্যাচারাল (মিষ্টি মেয়ের কণ্ঠ)",
     hiLabel: "जानू नेचुरल (मधुर महिला आवाज़)",
+    enLabel: "Janu Natural (Warm Female Voice)",
     bnDesc: "নরম, স্পষ্ট এবং স্বাভাবিক মেয়েলি কণ্ঠস্বর",
     hiDesc: "मधुर, स्पष्ट और स्वाभाविक महिला आवाज़",
+    enDesc: "Warm, natural, crystal-clear female assistant voice",
   },
   {
     id: "Zephyr",
     label: "Janu Bright (Female)",
     bnLabel: "জানু প্রাণবন্ত (তরুণী কণ্ঠ)",
     hiLabel: "जानू ब्राइट (युवा महिला आवाज़)",
+    enLabel: "Janu Bright (Youthful Female Voice)",
     bnDesc: "উচ্ছল, প্রাণবন্ত ও আধুনিক তরুণী কণ্ঠ",
     hiDesc: "जीवंत, ऊर्जावान और आधुनिक महिला आवाज़",
+    enDesc: "Energetic, cheerful, modern young female voice",
   },
   {
     id: "PiyaSweet",
     label: "Janu Cute Anime (Female)",
     bnLabel: "জানু কিউট অ্যানিমে (কোমল কণ্ঠ)",
     hiLabel: "जानू क्यूट एनीमे (कोमल महिला आवाज़)",
+    enLabel: "Janu Sweet Anime (Soft Female Voice)",
     bnDesc: "মিষ্টি অ্যানিমে ধাঁচের কোমল মেয়েলি কণ্ঠ",
     hiDesc: "प्यारी एनीमे शैली की कोमल महिला आवाज़",
+    enDesc: "Sweet anime-inspired gentle female voice",
   },
   {
     id: "PiyaCalm",
     label: "Janu Calm (Female)",
     bnLabel: "জানু শান্ত (মার্জিত মেয়ের কণ্ঠ)",
     hiLabel: "जानू शांत (सौम्य महिला आवाज़)",
+    enLabel: "Janu Calm (Serene Female Voice)",
     bnDesc: "শান্ত, ধীরস্থির ও স্নিগ্ধ মেয়েলি উচ্চারণ",
     hiDesc: "शांत, सौम्य और स्पष्ट महिला उच्चारण",
+    enDesc: "Calm, composed, soothing female articulation",
   },
 ];
 
@@ -175,11 +185,13 @@ export const UI_COPY: Record<
     subtitle: string;
     startAssistant: string;
     voiceReady: string;
+    voiceWakeStandby: string;
     voiceListening: string;
     voiceThinking: string;
     voiceSpeaking: string;
     micDenied: string;
     offlineMode: string;
+    offlineLocalActive: string;
     tapToSpeak: string;
     stopListening: string;
     stopSpeaking: string;
@@ -190,19 +202,24 @@ export const UI_COPY: Record<
     tabHome: string;
     tabActions: string;
     tabMemory: string;
+    alwaysActiveTitle: string;
+    alwaysActiveOnLabel: string;
+    alwaysActiveOffLabel: string;
     samplePrompts: string[];
   }
 > = {
   bn: {
     heroTitle: "আপনার ব্যক্তিগত ভয়েস অ্যাসিস্ট্যান্ট",
-    subtitle: "বাংলা ও হিন্দিতে কথা বলুন, প্রশ্ন করুন এবং ফোনের কাজ নিয়ন্ত্রণ করুন।",
+    subtitle: "বাংলা, হিন্দি ও ইংরেজিতে কথা বলুন, Wake Word বললেই জানু সাড়া দেবে।",
     startAssistant: "জানু চালু করুন",
     voiceReady: "কথা শুনতে প্রস্তুত",
+    voiceWakeStandby: "সর্বদা সক্রিয় · 'Hey Janu' বা 'জানু' বলুন",
     voiceListening: "জানু শুনছে... (কথা শেষে পাঠান চাপুন)",
     voiceThinking: "জানু উত্তর দিচ্ছে...",
     voiceSpeaking: "জানু কথা বলছে...",
     micDenied: "মাইক্রোফোন অনুমতি প্রয়োজন",
-    offlineMode: "ইন্টারনেট সংযোগ নেই",
+    offlineMode: "অফলাইন লোকাল ভয়েস মোড চালু আছে",
+    offlineLocalActive: "অফলাইন মোড · লোকাল কমান্ড সক্রিয়",
     tapToSpeak: "বলুন",
     stopListening: "পাঠান",
     stopSpeaking: "থামান",
@@ -210,10 +227,13 @@ export const UI_COPY: Record<
     confirmBtn: "হ্যাঁ, করুন",
     cancelBtn: "বাতিল",
     welcomeGreeting:
-      "নমস্কার! আমি জানু এআই (Janu AI)। মাইক্রোফোন ট্যাপ করে বাংলায় বা হিন্দিতে কথা বলুন।",
+      "নমস্কার! আমি জানু এআই (Janu AI)। বাংলা, হিন্দি বা ইংরেজিতে কথা বলুন অথবা Always Active চালু করে 'Hey Janu' বলুন।",
     tabHome: "জানু এআই",
     tabActions: "ফোন কন্ট্রোল",
     tabMemory: "মেমোরি",
+    alwaysActiveTitle: "Always Active Voice Assistant",
+    alwaysActiveOnLabel: "সর্বদা সক্রিয় চালু (Wake Word শুনছে)",
+    alwaysActiveOffLabel: "সর্বদা সক্রিয় বন্ধ আছে",
     samplePrompts: [
       "পরাণকে কল করো",
       "রহিমকে ফোন লাগাও",
@@ -225,14 +245,16 @@ export const UI_COPY: Record<
   },
   hi: {
     heroTitle: "आपकी व्यक्तिगत वॉयस असिस्टेंट",
-    subtitle: "हिन्दी और बंगाली में बात करें, सवाल पूछें और फ़ोन के कार्य नियंत्रित करें।",
+    subtitle: "हिन्दी, बंगाली और अंग्रेज़ी में बात करें — 'Hey Janu' बोलते ही जानू सुनेगी।",
     startAssistant: "जानू शुरू करें",
     voiceReady: "सुनने के लिए तैयार",
+    voiceWakeStandby: "हमेशा सक्रिय · 'Hey Janu' या 'जानू' बोलें",
     voiceListening: "जानू सुन रही है... (बोलकर भेजें दबाएँ)",
     voiceThinking: "जानू उत्तर दे रही है...",
     voiceSpeaking: "जानू बोल रही है...",
     micDenied: "माइक्रोफ़ोन अनुमति आवश्यक है",
-    offlineMode: "इंटरनेट कनेक्शन नहीं है",
+    offlineMode: "ऑफ़लाइन लोकल वॉयस मोड सक्रिय है",
+    offlineLocalActive: "ऑफ़लाइन मोड · लोकल कमांड सक्रिय",
     tapToSpeak: "बोलें",
     stopListening: "भेजें",
     stopSpeaking: "रोकें",
@@ -240,10 +262,13 @@ export const UI_COPY: Record<
     confirmBtn: "हाँ, करें",
     cancelBtn: "रद्द करें",
     welcomeGreeting:
-      "नमस्ते! मैं जानू एआई (Janu AI) हूँ। माइक्रोफ़ोन टैप करके हिन्दी या बंगाली में बात करें।",
+      "नमस्ते! मैं जानू एआई (Janu AI) हूँ। हिन्दी, बंगाली या अंग्रेज़ी में बात करें या Always Active चालू करके 'Hey Janu' बोलें।",
     tabHome: "जानू एआई",
     tabActions: "फ़ोन कंट्रोल",
     tabMemory: "मेमोरी",
+    alwaysActiveTitle: "Always Active Voice Assistant",
+    alwaysActiveOnLabel: "हमेशा सक्रिय चालू (Wake Word सुन रही है)",
+    alwaysActiveOffLabel: "हमेशा सक्रिय बंद है",
     samplePrompts: [
       "Poran को कॉल करो",
       "Rahim को फ़ोन लगाओ",
@@ -251,6 +276,41 @@ export const UI_COPY: Record<
       "सुबह 7 बजकर 30 मिनट का अलार्म लगाओ",
       "फ़ोन की बैटरी कितनी है?",
       "याद रखो मुझे मसाला चाय पसंद है",
+    ],
+  },
+  en: {
+    heroTitle: "Your Personal Voice Assistant",
+    subtitle: "Speak naturally in Bengali, Hindi, or English — hands-free with Wake Word.",
+    startAssistant: "Launch Janu",
+    voiceReady: "Ready to listen",
+    voiceWakeStandby: "Always Active · Say 'Hey Janu' or 'Janu'",
+    voiceListening: "Janu is listening...",
+    voiceThinking: "Janu is thinking...",
+    voiceSpeaking: "Janu is speaking...",
+    micDenied: "Microphone permission required",
+    offlineMode: "Offline Local Voice Mode Active",
+    offlineLocalActive: "Offline Mode · Local Commands Ready",
+    tapToSpeak: "Speak",
+    stopListening: "Send",
+    stopSpeaking: "Stop",
+    typePlaceholder: "Speak or type to Janu...",
+    confirmBtn: "Yes, Proceed",
+    cancelBtn: "Cancel",
+    welcomeGreeting:
+      "Hello! I am Janu AI. Speak in Bengali, Hindi, or English, or turn on Always Active Mode and say 'Hey Janu'.",
+    tabHome: "Janu AI",
+    tabActions: "Phone Control",
+    tabMemory: "Memory",
+    alwaysActiveTitle: "Always Active Voice Assistant",
+    alwaysActiveOnLabel: "Always Active ON (Listening for Wake Word)",
+    alwaysActiveOffLabel: "Always Active OFF",
+    samplePrompts: [
+      "Call Poran",
+      "Turn on the flashlight",
+      "Play new Bengali songs on YouTube",
+      "Set an alarm for 7:30 AM",
+      "What is my battery percentage?",
+      "Remember my favorite color is cyan",
     ],
   },
 };
@@ -270,6 +330,78 @@ export function applyThemeCssVariables(themeId: ThemeId): void {
 }
 
 /**
+ * Extracts wake word match ("Janu", "Hey Janu", "জানু", "হেই জানু", "जानू", "हे जानू", or custom wakeWord)
+ * and any inline command spoken immediately after the wake word.
+ */
+export function extractWakeWordAndCommand(
+  rawTranscript: string,
+  customWakeWord = "Janu"
+): { matched: boolean; inlineCommand: string } {
+  const cleaned = rawTranscript.trim().replace(/\s+/g, " ");
+  if (!cleaned) return { matched: false, inlineCommand: "" };
+
+  const customClean = customWakeWord.trim().toLowerCase();
+  const baseAliases = [
+    "hey janu",
+    "hi janu",
+    "hello janu",
+    "ok janu",
+    "okay janu",
+    "o janu",
+    "hey jaanu",
+    "হেই জানু",
+    "হে জানু",
+    "হ্যালো জানু",
+    "ও জানু",
+    "শোনো জানু",
+    "জানু এআই",
+    "हे जानू",
+    "हाय जानू",
+    "हेलो जानू",
+    "ओ जानू",
+    "सुनो जानू",
+    "जानू एआई",
+    "janu ai",
+    "jaanu",
+    "janoo",
+    "janu",
+    "জানু",
+    "जानू",
+  ];
+
+  if (customClean && !baseAliases.includes(customClean)) {
+    baseAliases.unshift(`hey ${customClean}`, customClean);
+  }
+
+  const lower = cleaned.toLowerCase();
+
+  for (const alias of baseAliases) {
+    const idx = lower.indexOf(alias);
+    if (idx !== -1) {
+      // Ensure word boundary for short Latin words so random substrings don't false-trigger
+      const beforeChar = idx > 0 ? lower[idx - 1] : " ";
+      const afterIdx = idx + alias.length;
+      const afterChar = afterIdx < lower.length ? lower[afterIdx] : " ";
+      const boundaryBefore = /[\s,।.!?-]/.test(beforeChar);
+      const boundaryAfter = /[\s,।.!?:;-]/.test(afterChar);
+
+      if (boundaryBefore && boundaryAfter) {
+        const remainder = cleaned
+          .slice(afterIdx)
+          .replace(/^[\s,।.!?:;-]+/, "")
+          .trim();
+        return {
+          matched: true,
+          inlineCommand: remainder,
+        };
+      }
+    }
+  }
+
+  return { matched: false, inlineCommand: "" };
+}
+
+/**
  * Checks if spoken/typed input is an affirmative or negative confirmation in Bengali, Hindi, or English,
  * or contains a 4-digit contact selector.
  */
@@ -277,7 +409,6 @@ export function parseVoiceConfirmationIntent(input: string): {
   decision: "confirm" | "cancel" | null;
   fourDigits: string | null;
 } {
-  // Normalize Bengali & Devanagari numerals to ASCII digits so "৪৮২১" or "४८२१" matches "4821"!
   const normalizedDigits = input
     .replace(/[০-৯]/g, (d) => String(d.charCodeAt(0) - 0x09e6))
     .replace(/[०-९]/g, (d) => String(d.charCodeAt(0) - 0x0966));
@@ -311,6 +442,8 @@ export function parseVoiceConfirmationIntent(input: string): {
     "yep",
     "sure",
     "confirm",
+    "proceed",
+    "go ahead",
     "ok",
     "okay",
     "hyan",
@@ -332,6 +465,7 @@ export function parseVoiceConfirmationIntent(input: string): {
     "nope",
     "cancel",
     "stop",
+    "abort",
     "nahi",
   ];
 

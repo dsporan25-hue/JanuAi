@@ -140,7 +140,7 @@ export const MemoryVaultPanel: React.FC<MemoryVaultPanelProps> = ({
         <div className="space-y-2.5 pt-2">
           {memories.length === 0 ? (
             <div className="rounded-xl border border-slate-800/80 bg-[#070d1b] p-6 text-center text-xs text-slate-400">
-              No saved preferences yet. Tell Janu AI &ldquo;মনে রাখো...&rdquo; or &ldquo;याद रखो...&rdquo; or add one above.
+              No saved preferences yet. Tell Janu AI &ldquo;মনে রাখো...&rdquo;, &ldquo;याद रखो...&rdquo;, or &ldquo;Remember...&rdquo; — or add one above.
             </div>
           ) : (
             memories.map((m) => (
@@ -208,7 +208,13 @@ export const MemoryVaultPanel: React.FC<MemoryVaultPanelProps> = ({
                     {msg.role === "user" ? "User" : "Janu AI"}
                   </span>
                   <span className="mx-1.5">·</span>
-                  <span>{msg.language === "bn" ? "বাংলা" : "हिन्दी"}</span>
+                  <span>
+                    {msg.language === "bn"
+                      ? "বাংলা"
+                      : msg.language === "hi"
+                      ? "हिन्दी"
+                      : "English"}
+                  </span>
                 </div>
                 <p className="text-slate-200 leading-relaxed">{msg.text}</p>
               </div>

@@ -9,6 +9,7 @@ import {
   Brain,
   Mic,
   Play,
+  Radio,
   Settings,
   Sparkles,
   User,
@@ -17,8 +18,11 @@ import {
 } from "lucide-react";
 import type {
   AlarmItem,
+  AlwaysActiveStage,
+  AlwaysActiveStatus,
   AppSettings,
   AssistantVisualState,
+  BackgroundTurnRecord,
   BatteryInfo,
   ChatMessage,
   ContactItem,
@@ -41,6 +45,7 @@ import {
   buildTelHref,
   buildYouTubeSearchUrl,
   checkDeviceAdminStatus,
+  drainNativeBackgroundTurns,
   executeDeviceLock,
   executeSystemSettingsOpen,
   isNativeAndroidRuntime,
@@ -48,16 +53,21 @@ import {
   PiyaNativePlugin,
   playAlarmChime,
   readLiveBatteryStatus,
+  readNativeAlwaysActiveStatus,
   resolveAppLaunchTarget,
   setHardwareFlashlight,
+  setNativeAlwaysActiveService,
+  syncNativeAssistantContext,
 } from "./services/androidBridge";
 import {
   fetchApiJson,
   PiyaVoiceEngine,
   queryMicrophonePermission,
   requestExplicitMicrophoneAccess,
+  WebAlwaysActiveWakeController,
 } from "./services/voiceEngine";
 import type { LipSyncFrame, MicPermissionState } from "./services/voiceEngine";
+import { evaluateLocalOfflineCommand } from "./services/offlineLocalBrain";
 import { OFFICIAL_PIYA_CHARACTER_IMAGE, PiyaCharacter3D } from "./components/PiyaCharacter3D";
 import { AssistantFullScreen } from "./components/AssistantFullScreen";
 import { PhoneActionsPanel } from "./components/PhoneActionsPanel";
@@ -85,7 +95,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   characterMode: "3d-rig",
   memoryEnabled: true,
   autoConfirmMemory: false,
-  preferNeuralTts: false, // Super Fast Instant Voice Mode by default
+  preferNeuralTts: false,
+  alwaysActiveVoice: false,
+  wakeWord: "Janu",
 };
 
 const DEFAULT_PROFILE: UserProfile = {
@@ -112,13 +124,23 @@ export default function App() {
   const [profileOpen, setProfileOpen] = useState(false);
 
   const [settings, setSettings] = useState<AppSettings>(() => {
-    const loaded = loadStoredJson<AppSettings>(STORAGE_KEYS.settings, DEFAULT_SETTINGS);
+    const loaded = {
+      ...DEFAULT_SETTINGS,
+      ...loadStoredJson<Partial<AppSettings>>(STORAGE_KEYS.settings, DEFAULT_SETTINGS),
+    };
     const validFemaleVoices = ["Kore", "Zephyr", "PiyaSweet", "PiyaCalm"];
     if (!validFemaleVoices.includes(loaded.voiceName)) {
       loaded.voiceName = "Kore";
     }
+    if (!["bn", "hi", "en"].includes(loaded.language)) {
+      loaded.language = "bn";
+    }
+    if (!loaded.wakeWord || !loaded.wakeWord.trim()) {
+      loaded.wakeWord = "Janu";
+    }
     return loaded;
   });
+
   const [profile, setProfile] = useState<UserProfile>(() =>
     loadStoredJson<UserProfile>(STORAGE_KEYS.profile, DEFAULT_PROFILE)
   );
@@ -144,6 +166,18 @@ export default function App() {
     typeof navigator !== "undefined" ? navigator.onLine : true
   );
 
+  const [alwaysActiveStatus, setAlwaysActiveStatus] = useState<AlwaysActiveStatus>(() => ({
+    enabled: settings.alwaysActiveVoice,
+    running: false,
+    stage: settings.alwaysActiveVoice ? "wake_standby" : "off",
+    mode: typeof navigator !== "undefined" && !navigator.onLine ? "offline" : "online",
+    wakeWord: settings.wakeWord || "Janu",
+    batteryOptimizationIgnored: true,
+    notificationPermissionGranted: true,
+    micPermissionGranted: true,
+    statusMessage: "",
+  }));
+
   const [lipSync, setLipSync] = useState<LipSyncFrame>({
     mouthOpen: 0,
     mouthSpread: 0.35,
@@ -168,8 +202,17 @@ export default function App() {
   if (!voiceEngineRef.current) {
     voiceEngineRef.current = new PiyaVoiceEngine();
   }
-  const finishingMicRef = useRef(false);
+  const webWakeControllerRef = useRef<WebAlwaysActiveWakeController | null>(null);
+  if (!webWakeControllerRef.current) {
+    webWakeControllerRef.current = new WebAlwaysActiveWakeController();
+  }
 
+  const finishingMicRef = useRef(false);
+  const turnInFlightRef = useRef(false);
+  const lastExecutedCmdRef = useRef<{ norm: string; at: number }>({ norm: "", at: 0 });
+  const ingestedBgTurnIdsRef = useRef<Set<string>>(new Set());
+
+  // Persist user settings & data across restarts
   useEffect(() => {
     applyThemeCssVariables(settings.theme);
     document.documentElement.lang = settings.language;
@@ -199,9 +242,98 @@ export default function App() {
   useEffect(() => {
     window.localStorage.setItem(
       STORAGE_KEYS.history,
-      JSON.stringify(messages.filter((m) => !m.isError).slice(-40))
+      JSON.stringify(messages.filter((m) => !m.isError).slice(-50))
     );
   }, [messages]);
+
+  // Keep Native Android Foreground Service synced with latest contacts, memories, language, and conversation history
+  useEffect(() => {
+    syncNativeAssistantContext({
+      language: settings.language,
+      wakeWord: settings.wakeWord,
+      speechSpeed: settings.speechSpeed,
+      voiceName: settings.voiceName,
+      contacts,
+      memories: settings.memoryEnabled ? memories : [],
+      messages,
+    });
+  }, [
+    contacts,
+    memories,
+    messages,
+    settings.language,
+    settings.memoryEnabled,
+    settings.speechSpeed,
+    settings.voiceName,
+    settings.wakeWord,
+  ]);
+
+  const ingestBackgroundTurnRecord = useCallback((rec: BackgroundTurnRecord) => {
+    if (!rec || !rec.id || ingestedBgTurnIdsRef.current.has(rec.id)) return;
+    ingestedBgTurnIdsRef.current.add(rec.id);
+
+    const lang: LanguageCode =
+      rec.language === "hi" ? "hi" : rec.language === "en" ? "en" : "bn";
+    const ts = rec.timestamp || new Date().toISOString();
+
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `${rec.id}_u`,
+        role: "user",
+        text: rec.userText,
+        language: lang,
+        timestamp: ts,
+      },
+      {
+        id: `${rec.id}_a`,
+        role: "assistant",
+        text: rec.assistantText,
+        language: lang,
+        timestamp: ts,
+        actionBadge: rec.actionBadge,
+      },
+    ]);
+
+    if (rec.noteTitle || rec.noteContent) {
+      setNotes((prev) => [
+        {
+          id: `nt_${rec.id}`,
+          title: rec.noteTitle || "Voice Note",
+          content: rec.noteContent || rec.userText,
+          createdAt: ts,
+        },
+        ...prev,
+      ]);
+    }
+
+    if (typeof rec.alarmHour === "number" && typeof rec.alarmMinute === "number") {
+      setAlarms((prev) => [
+        {
+          id: `alm_${rec.id}`,
+          hour: rec.alarmHour!,
+          minute: rec.alarmMinute!,
+          label: rec.alarmLabel || "Janu AI Alarm",
+          enabled: true,
+        },
+        ...prev,
+      ]);
+    }
+  }, []);
+
+  const syncFromBackgroundService = useCallback(async () => {
+    if (!isNativeAndroidRuntime()) return;
+    const drained = await drainNativeBackgroundTurns();
+    drained.forEach(ingestBackgroundTurnRecord);
+    const nativeStatus = await readNativeAlwaysActiveStatus(navigator.onLine);
+    if (nativeStatus) {
+      setAlwaysActiveStatus(nativeStatus);
+      // Restore saved native preference if enabled on Android boot/reopen
+      if (nativeStatus.enabled && !settings.alwaysActiveVoice) {
+        setSettings((prev) => ({ ...prev, alwaysActiveVoice: true }));
+      }
+    }
+  }, [ingestBackgroundTurnRecord, settings.alwaysActiveVoice]);
 
   const refreshDeviceTelemetry = useCallback(async () => {
     const bat = await readLiveBatteryStatus();
@@ -210,21 +342,43 @@ export default function App() {
     setDeviceAdminActive(admin);
   }, []);
 
+  // Online / Offline & Visibility Lifecycle (NEVER turns off Always Active Switch!)
   useEffect(() => {
     queryMicrophonePermission().then(setMicPermission);
     refreshDeviceTelemetry();
+    syncFromBackgroundService();
 
-    const handleOnline = () => setIsOnline(true);
-    const handleOffline = () => {
-      setIsOnline(false);
-      setErrorBanner(
+    const handleOnline = () => {
+      setIsOnline(true);
+      setErrorBanner(null);
+      setAlwaysActiveStatus((prev) => ({ ...prev, mode: "online" }));
+      setActionStatusToast(
         settings.language === "bn"
-          ? "ইন্টারনেট সংযোগ বিচ্ছিন্ন হয়েছে।"
-          : "इंटरनेट कनेक्शन टूट गया है।"
+          ? "ইন্টারনেট সংযুক্ত হয়েছে — জানু আবার অনলাইন এআই মোডে ফিরেছে।"
+          : settings.language === "hi"
+          ? "इंटरनेट जुड़ गया है — जानू वापस ऑनलाइन एआई मोड में है।"
+          : "Internet restored — Janu switched back to Online AI Mode."
       );
     };
+
+    const handleOffline = () => {
+      setIsOnline(false);
+      setAlwaysActiveStatus((prev) => ({ ...prev, mode: "offline" }));
+      setActionStatusToast(
+        settings.language === "bn"
+          ? "ইন্টারনেট নেই — জানু স্বয়ংক্রিয়ভাবে অফলাইন লোকাল মোডে কাজ করছে।"
+          : settings.language === "hi"
+          ? "इंटरनेट बंद है — जानू ऑफ़लाइन लोकल मोड में काम कर रही है।"
+          : "Offline — Janu switched to Local Voice Command Mode."
+      );
+    };
+
     const handleVisibilityChange = () => {
-      if (document.hidden) {
+      if (!document.hidden) {
+        syncFromBackgroundService();
+        queryMicrophonePermission().then(setMicPermission);
+      } else if (!settings.alwaysActiveVoice) {
+        // Strict privacy: when Always Active is OFF, stop any manual mic capture on minimize
         voiceEngineRef.current?.cancelListening();
         setVisualState((s) => (s === "listening" ? "idle" : s));
         setMicLevel(0);
@@ -239,10 +393,65 @@ export default function App() {
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
-      voiceEngineRef.current?.cancelListening();
-      voiceEngineRef.current?.stopSpeaking();
     };
-  }, [refreshDeviceTelemetry, settings.language]);
+  }, [refreshDeviceTelemetry, settings.alwaysActiveVoice, settings.language, syncFromBackgroundService]);
+
+  // Subscribe to Native Android Foreground Service real-time events
+  useEffect(() => {
+    if (!isNativeAndroidRuntime()) return;
+
+    let listenerHandle: { remove: () => Promise<void> } | null = null;
+    PiyaNativePlugin.addListener("alwaysActiveEvent", (ev) => {
+      if (ev.eventType === "state") {
+        const nextStage = (ev.stage || "wake_standby") as AlwaysActiveStage;
+        setAlwaysActiveStatus((prev) => ({
+          ...prev,
+          enabled: ev.enabled ?? prev.enabled,
+          running: ev.running ?? prev.running,
+          stage: nextStage,
+          mode: ev.online === false ? "offline" : "online",
+          statusMessage: ev.statusMessage || prev.statusMessage,
+        }));
+        if (typeof ev.partialTranscript === "string") {
+          setInterimTranscript(ev.partialTranscript);
+        }
+        if (nextStage === "paused_permission") {
+          setMicPermission("denied");
+        }
+      } else if (ev.eventType === "turn" && ev.turnJson) {
+        try {
+          const parsed = JSON.parse(ev.turnJson) as BackgroundTurnRecord;
+          ingestBackgroundTurnRecord(parsed);
+        } catch {
+          // Ignore malformed event
+        }
+      }
+    }).then((h) => {
+      listenerHandle = h;
+    });
+
+    // If user left Always Active ON before closing app, ensure Foreground Service is active now
+    if (settings.alwaysActiveVoice) {
+      setNativeAlwaysActiveService({
+        enabled: true,
+        language: settings.language,
+        wakeWord: settings.wakeWord,
+        speechSpeed: settings.speechSpeed,
+        voiceName: settings.voiceName,
+        contacts,
+        memories: settings.memoryEnabled ? memories : [],
+        messages,
+        isOnline,
+      }).then((st) => {
+        if (st) setAlwaysActiveStatus(st);
+      });
+    }
+
+    return () => {
+      listenerHandle?.remove().catch(() => {});
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ingestBackgroundTurnRecord]);
 
   // Active In-App Alarm Scheduler
   useEffect(() => {
@@ -271,9 +480,19 @@ export default function App() {
     setSettings((prev) => ({ ...prev, ...patch }));
   }, []);
 
+  const resumeAlwaysActiveAfterTurn = useCallback(() => {
+    if (!settings.alwaysActiveVoice) return;
+    if (isNativeAndroidRuntime()) {
+      PiyaNativePlugin.yieldServiceMic({ pause: false }).catch(() => {});
+    } else {
+      webWakeControllerRef.current?.resumeWakeStandby();
+    }
+  }, [settings.alwaysActiveVoice]);
+
   const speakAssistantReply = useCallback(
     async (text: string, lang: LanguageCode, preloadedAudioBase64?: string) => {
       if (!voiceEngineRef.current) return;
+      webWakeControllerRef.current?.pauseForTurnProcessing();
       setVisualState("speaking");
       await voiceEngineRef.current.speakResponse({
         text,
@@ -287,13 +506,20 @@ export default function App() {
         onEnd: () => {
           setLipSync({ mouthOpen: 0, mouthSpread: 0.35, energy: 0 });
           setVisualState("idle");
+          resumeAlwaysActiveAfterTurn();
         },
         onError: () => {
           setVisualState("idle");
+          resumeAlwaysActiveAfterTurn();
         },
       });
     },
-    [settings.preferNeuralTts, settings.speechSpeed, settings.voiceName]
+    [
+      resumeAlwaysActiveAfterTurn,
+      settings.preferNeuralTts,
+      settings.speechSpeed,
+      settings.voiceName,
+    ]
   );
 
   const appendMessage = useCallback(
@@ -333,7 +559,9 @@ export default function App() {
         const notFoundMsg =
           activeLang === "bn"
             ? `দুঃখিত, "${contactName || lastFourDigits || ""}" নামে কোনো সেভ করা কন্টাক্ট পাওয়া যায়নি।`
-            : `क्षमा करें, "${contactName || lastFourDigits || ""}" नाम का कोई सेव किया गया कॉन्टैक्ट नहीं मिला।`;
+            : activeLang === "hi"
+            ? `क्षमा करें, "${contactName || lastFourDigits || ""}" नाम का कोई सेव किया गया कॉन्टैक्ट नहीं मिला।`
+            : `Sorry, I could not find a saved contact matching "${contactName || lastFourDigits || ""}".`;
         return { pending: null, spokenOverride: notFoundMsg };
       }
 
@@ -342,12 +570,19 @@ export default function App() {
         const explain =
           activeLang === "bn"
             ? `আমি ${target.name}-এর নম্বর (${target.phone}) পেয়েছি। আপনি কি কল করতে চান?`
-            : `मुझे ${target.name} का कॉन्टैक्ट (${target.phone}) मिल गया है। क्या मैं कॉल लगाऊँ?`;
+            : activeLang === "hi"
+            ? `मुझे ${target.name} का कॉन्टैक्ट (${target.phone}) मिल गया है। क्या मैं कॉल लगाऊँ?`
+            : `I found ${target.name} (${target.phone}). Would you like me to place the call?`;
         return {
           pending: {
             id: `pa_${Date.now()}`,
             type: "call_confirm",
-            title: activeLang === "bn" ? `কল নিশ্চিতকরণ: ${target.name}` : `कॉल पुष्टि: ${target.name}`,
+            title:
+              activeLang === "bn"
+                ? `কল নিশ্চিতকরণ: ${target.name}`
+                : activeLang === "hi"
+                ? `कॉल पुष्टि: ${target.name}`
+                : `Confirm Call: ${target.name}`,
             explanation: explain,
             selectedContact: target,
             intentHref: isNativeAndroidRuntime() ? undefined : buildTelHref(target.phone),
@@ -362,7 +597,9 @@ export default function App() {
       const disambiguateMsg =
         activeLang === "bn"
           ? `একাধিক কন্টাক্ট পাওয়া গেছে: ${namesSummary}। অনুগ্রহ করে নাম অথবা শেষ চারটি ডিজিট বলুন।`
-          : `एक से अधिक कॉन्टैक्ट मिले हैं: ${namesSummary}। कृपया नाम या आखिरी चार अंक बताएँ।`;
+          : activeLang === "hi"
+          ? `एक से अधिक कॉन्टैक्ट मिले हैं: ${namesSummary}। कृपया नाम या आखिरी चार अंक बताएँ।`
+          : `Multiple contacts found: ${namesSummary}. Please say the full name or last four digits.`;
 
       return {
         pending: {
@@ -371,7 +608,9 @@ export default function App() {
           title:
             activeLang === "bn"
               ? `${matches.length}টি কন্টাক্ট পাওয়া গেছে`
-              : `${matches.length} कॉन्टैक्ट मिले`,
+              : activeLang === "hi"
+              ? `${matches.length} कॉन्टैक्ट मिले`
+              : `${matches.length} Contacts Found`,
           explanation: disambiguateMsg,
           matchedContacts: matches,
         },
@@ -387,12 +626,19 @@ export default function App() {
       const explain =
         lang === "bn"
           ? `${contact.name} (${contact.phone}) নির্বাচন করা হয়েছে। এখন কি কল করব?`
-          : `${contact.name} (${contact.phone}) चुना गया है। क्या अब कॉल करूँ?`;
+          : lang === "hi"
+          ? `${contact.name} (${contact.phone}) चुना गया है। क्या अब कॉल करूँ?`
+          : `Selected ${contact.name} (${contact.phone}). Should I call now?`;
 
       setPendingAction({
         id: `pa_${Date.now()}`,
         type: "call_confirm",
-        title: lang === "bn" ? `কল নিশ্চিতকরণ: ${contact.name}` : `कॉल पुष्टि: ${contact.name}`,
+        title:
+          lang === "bn"
+            ? `কল নিশ্চিতকরণ: ${contact.name}`
+            : lang === "hi"
+            ? `कॉल पुष्टि: ${contact.name}`
+            : `Confirm Call: ${contact.name}`,
         explanation: explain,
         selectedContact: contact,
         intentHref: isNativeAndroidRuntime() ? undefined : buildTelHref(contact.phone),
@@ -421,7 +667,9 @@ export default function App() {
       const msg =
         lang === "bn"
           ? `${act.selectedContact.name}-কে এখন কল করা হচ্ছে।`
-          : `अब ${act.selectedContact.name} को कॉल लगाया जा रहा है।`;
+          : lang === "hi"
+          ? `अब ${act.selectedContact.name} को कॉल लगाया जा रहा है।`
+          : `Calling ${act.selectedContact.name} now.`;
       appendMessage("assistant", msg, lang, { actionBadge: "Calling" });
       await speakAssistantReply(msg, lang);
       return;
@@ -437,7 +685,9 @@ export default function App() {
       const msg =
         lang === "bn"
           ? `ইউটিউবে "${act.youtubeQuery}" খোলা হচ্ছে।`
-          : `YouTube पर "${act.youtubeQuery}" खोला जा रहा है।`;
+          : lang === "hi"
+          ? `YouTube पर "${act.youtubeQuery}" खोला जा रहा है।`
+          : `Opening "${act.youtubeQuery}" on YouTube.`;
       appendMessage("assistant", msg, lang, { actionBadge: "YouTube" });
       await speakAssistantReply(msg, lang);
       return;
@@ -455,7 +705,9 @@ export default function App() {
       const msg =
         lang === "bn"
           ? `${act.appName} খোলা হচ্ছে।`
-          : `${act.appName} खोला जा रहा है।`;
+          : lang === "hi"
+          ? `${act.appName} खोला जा रहा है।`
+          : `Opening ${act.appName}.`;
       appendMessage("assistant", msg, lang, { actionBadge: "Open App" });
       await speakAssistantReply(msg, lang);
       return;
@@ -467,10 +719,14 @@ export default function App() {
       const msg = lockRes.locked
         ? lang === "bn"
           ? "ফোন লক করা হয়েছে।"
-          : "फ़ोन लॉक कर दिया गया है।"
+          : lang === "hi"
+          ? "फ़ोन लॉक कर दिया गया है।"
+          : "Phone screen locked."
         : lang === "bn"
         ? "ফোন লক করতে হলে Android APK-তে Device Administrator অনুমতি সক্রিয় করুন।"
-        : "फ़ोन लॉक करने के लिए Android APK में Device Administrator अनुमति सक्रिय करें।";
+        : lang === "hi"
+        ? "फ़ोन लॉक करने के लिए Android APK में Device Administrator अनुमति सक्रिय करें।"
+        : "Enable Device Administrator permission in the Janu AI Android APK to lock the screen.";
       appendMessage("assistant", msg, lang, {
         actionBadge: lockRes.locked ? "Locked" : "Device Admin",
       });
@@ -482,6 +738,7 @@ export default function App() {
       const res = await executeSystemSettingsOpen(act.settingSection);
       setActionStatusToast(res.message);
       appendMessage("assistant", res.message, lang, { actionBadge: "Settings" });
+      resumeAlwaysActiveAfterTurn();
       return;
     }
 
@@ -502,7 +759,9 @@ export default function App() {
       const msg =
         lang === "bn"
           ? `${formattedTime} সময়ের জন্য অ্যালার্ম সেট করা হয়েছে।`
-          : `${formattedTime} बजे के लिए अलार्म सेट कर दिया गया है।`;
+          : lang === "hi"
+          ? `${formattedTime} बजे के लिए अलार्म सेट कर दिया गया है।`
+          : `Alarm set for ${formattedTime}.`;
       appendMessage("assistant", msg, lang, { actionBadge: "Alarm Set" });
       await speakAssistantReply(msg, lang);
       return;
@@ -519,11 +778,19 @@ export default function App() {
       const msg =
         lang === "bn"
           ? "আপনার তথ্যটি মেমোরিতে সংরক্ষণ করা হয়েছে।"
-          : "आपकी जानकारी मेमोरी में सहेज ली गई है।";
+          : lang === "hi"
+          ? "आपकी जानकारी मेमोरी में सहेज ली गई है।"
+          : "Saved to your memory vault.";
       appendMessage("assistant", msg, lang, { actionBadge: "Memory Saved" });
       await speakAssistantReply(msg, lang);
     }
-  }, [appendMessage, pendingAction, settings.language, speakAssistantReply]);
+  }, [
+    appendMessage,
+    pendingAction,
+    resumeAlwaysActiveAfterTurn,
+    settings.language,
+    speakAssistantReply,
+  ]);
 
   const handleCancelPendingAction = useCallback(async () => {
     setPendingAction(null);
@@ -531,15 +798,13 @@ export default function App() {
     const msg =
       lang === "bn"
         ? "ঠিক আছে, কাজটি বাতিল করা হয়েছে।"
-        : "ठीक है, यह कार्य रद्द कर दिया गया है।";
+        : lang === "hi"
+        ? "ठीक है, यह कार्य रद्द कर दिया गया है।"
+        : "Okay, cancelled.";
     appendMessage("assistant", msg, lang, { actionBadge: "Cancelled" });
     await speakAssistantReply(msg, lang);
   }, [appendMessage, settings.language, speakAssistantReply]);
 
-  /**
-   * Checks if user text resolves an active confirmation/disambiguation dialog.
-   * Returns true if handled locally without needing an action override.
-   */
   const tryHandlePendingConfirmation = useCallback(
     async (spokenOrTyped: string, turnLang: LanguageCode): Promise<boolean> => {
       if (!pendingAction) return false;
@@ -601,9 +866,6 @@ export default function App() {
     ]
   );
 
-  /**
-   * Applies Gemini toolActions + speaks PIYA AI's reply immediately.
-   */
   const applyAssistantResponse = useCallback(
     async (
       userTranscript: string,
@@ -646,8 +908,10 @@ export default function App() {
               title: platform === "youtube_music" ? `YouTube Music: ${q}` : `YouTube: ${q}`,
               explanation:
                 replyLang === "bn"
-                  ? `"${q}" ইউটিউবে খুলতে হ্যাঁ চাপুন।`
-                  : `"${q}" को YouTube पर खोलने के लिए हाँ दबाएँ।`,
+                  ? `"${q}" ইউটিউবে খুলতে হ্যাঁ বলুন বা চাপুন।`
+                  : replyLang === "hi"
+                  ? `"${q}" को YouTube पर खोलने के लिए हाँ दबाएँ।`
+                  : `Confirm to open "${q}" on YouTube.`,
               youtubeQuery: q,
               youtubePlatform: platform,
               intentHref: isNativeAndroidRuntime() ? undefined : url,
@@ -663,7 +927,9 @@ export default function App() {
               explanation:
                 replyLang === "bn"
                   ? `${target.label} অ্যাপটি খুলতে চান?`
-                  : `क्या आप ${target.label} ऐप खोलना चाहते हैं?`,
+                  : replyLang === "hi"
+                  ? `क्या आप ${target.label} ऐप खोलना चाहते हैं?`
+                  : `Would you like to open ${target.label}?`,
               appName: target.label,
               intentHref: isNativeAndroidRuntime() || !target.href ? undefined : target.href,
             });
@@ -672,11 +938,18 @@ export default function App() {
             setPendingAction({
               id: `pa_${Date.now()}`,
               type: "lock_phone",
-              title: replyLang === "bn" ? "ফোন স্ক্রিন লক" : "फ़ोन स्क्रीन लॉक",
+              title:
+                replyLang === "bn"
+                  ? "ফোন স্ক্রিন লক"
+                  : replyLang === "hi"
+                  ? "फ़ोन स्क्रीन लॉक"
+                  : "Lock Phone Screen",
               explanation:
                 replyLang === "bn"
                   ? "জানু এআই ফোন লক করবে। আপনি কি নিশ্চিত?"
-                  : "जानू एआई फ़ोन लॉक करेगी। क्या आप पुष्टि करते हैं?",
+                  : replyLang === "hi"
+                  ? "जानू एआई फ़ोन लॉक करेगी। क्या आप पुष्टि करते हैं?"
+                  : "Janu AI will lock your phone screen. Confirm?",
             });
             actionBadge = "Lock Screen";
           } else if (tool.name === "openSystemSettings") {
@@ -704,7 +977,9 @@ export default function App() {
               finalSpokenReply =
                 replyLang === "bn"
                   ? "এই ব্রাউজারে ফ্ল্যাশলাইট কন্ট্রোল নেই। Android APK-তে এটি সরাসরি কাজ করে।"
-                  : "इस ब्राउज़र में फ़्लैशलाइट कंट्रोल उपलब्ध नहीं है। Android APK में यह सीधे काम करता है।";
+                  : replyLang === "hi"
+                  ? "इस ब्राउज़र में फ़्लैशलाइट कंट्रोल उपलब्ध नहीं है। Android APK में यह सीधे काम करता है।"
+                  : "Flashlight hardware control requires the Janu AI Android APK.";
             }
             actionBadge = "Flashlight";
           } else if (tool.name === "checkBatteryStatus") {
@@ -712,7 +987,9 @@ export default function App() {
               finalSpokenReply =
                 replyLang === "bn"
                   ? "আপনার বর্তমান ব্রাউজার ব্যাটারির তথ্য দিচ্ছে না। Android অ্যাপে এটি কাজ করে।"
-                  : "आपका ब्राउज़र बैटरी की जानकारी नहीं दे रहा है। Android ऐप में यह काम करता है।";
+                  : replyLang === "hi"
+                  ? "आपका ब्राउज़र बैटरी की जानकारी नहीं दे रहा है। Android ऐप में यह काम करता है।"
+                  : "Battery reading is unavailable in this browser, though supported in the Android APK.";
             }
             actionBadge = "Battery";
           } else if (tool.name === "setDeviceAlarm") {
@@ -727,7 +1004,9 @@ export default function App() {
               explanation:
                 replyLang === "bn"
                   ? `${tStr} সময়ে "${label}" অ্যালার্ম সেট করতে চান?`
-                  : `क्या आप ${tStr} बजे के लिए "${label}" अलार्म सेट करना चाहते हैं?`,
+                  : replyLang === "hi"
+                  ? `क्या आप ${tStr} बजे के लिए "${label}" अलार्म सेट करना चाहते हैं?`
+                  : `Set alarm "${label}" for ${tStr}?`,
               alarmData: { hour, minute, label },
             });
             actionBadge = `Alarm ${tStr}`;
@@ -761,11 +1040,18 @@ export default function App() {
                 setPendingAction({
                   id: `pa_${Date.now()}`,
                   type: "save_memory",
-                  title: replyLang === "bn" ? "মেমোরিতে সংরক্ষণ" : "मेमोरी में सहेजें",
+                  title:
+                    replyLang === "bn"
+                      ? "মেমোরিতে সংরক্ষণ"
+                      : replyLang === "hi"
+                      ? "मेमोरी में सहेजें"
+                      : "Save to Memory",
                   explanation:
                     replyLang === "bn"
                       ? `জানু কি এটি মনে রাখবে: "${fact}"?`
-                      : `क्या जानू यह याद रखे: "${fact}"?`,
+                      : replyLang === "hi"
+                      ? `क्या जानू यह याद रखे: "${fact}"?`
+                      : `Should Janu remember: "${fact}"?`,
                   memoryData: { category, fact },
                 });
                 actionBadge = "Save Memory";
@@ -796,80 +1082,140 @@ export default function App() {
   );
 
   // =========================================================================
-  // FAST TEXT CONVERSATION PROCESSOR
+  // UNIFIED ONLINE + OFFLINE CONVERSATION PROCESSOR (WITH DEDUPLICATION)
   // =========================================================================
   const processUserUtterance = useCallback(
     async (rawText: string, detectedLangHint?: LanguageCode) => {
       const trimmed = rawText.trim();
-      if (!trimmed) return;
-
-      voiceEngineRef.current?.unlockAudioOnGesture();
-
-      if (!isOnline) {
-        setErrorBanner(UI_COPY[settings.language].offlineMode);
+      if (!trimmed) {
+        resumeAlwaysActiveAfterTurn();
         return;
       }
+
+      // Deduplication guard: never execute the exact same command repeatedly
+      const normCmd = trimmed.toLowerCase().replace(/[।.,!?\s]+/g, " ").trim();
+      const nowMs = Date.now();
+      if (
+        turnInFlightRef.current ||
+        (normCmd === lastExecutedCmdRef.current.norm &&
+          nowMs - lastExecutedCmdRef.current.at < 4500)
+      ) {
+        resumeAlwaysActiveAfterTurn();
+        return;
+      }
+
+      turnInFlightRef.current = true;
+      lastExecutedCmdRef.current = { norm: normCmd, at: nowMs };
+
+      voiceEngineRef.current?.unlockAudioOnGesture();
+      webWakeControllerRef.current?.pauseForTurnProcessing();
 
       setErrorBanner(null);
       const turnLang = detectedLangHint || settings.language;
 
-      const handledPending = await tryHandlePendingConfirmation(trimmed, turnLang);
-      if (handledPending) return;
-
-      appendMessage("user", trimmed, turnLang);
-      setVisualState("thinking");
-
       try {
+        const handledPending = await tryHandlePendingConfirmation(trimmed, turnLang);
+        if (handledPending) return;
+
+        appendMessage("user", trimmed, turnLang);
+        setVisualState("thinking");
+
         const freshBattery = await readLiveBatteryStatus();
         setBattery(freshBattery);
 
-        const { ok, status, data } = await fetchApiJson<{
-          reply?: string;
-          language?: LanguageCode;
-          toolActions?: Array<{ id: string; name: string; args: Record<string, unknown> }>;
-          audioBase64?: string;
-          error?: string;
-        }>("/api/assistant/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            message: trimmed,
+        // OFFLINE MODE: Execute Local Offline Brain without turning OFF Always Active!
+        if (!navigator.onLine) {
+          const localRes = evaluateLocalOfflineCommand({
+            utterance: trimmed,
             preferredLanguage: settings.language,
-            inlineFemaleTts: !settings.preferNeuralTts,
-            history: messages.slice(-8).map((m) => ({
-              role: m.role,
-              text: m.text,
-            })),
-            memories: settings.memoryEnabled ? memories : [],
+            battery: freshBattery,
+            flashlightOn,
             contacts,
-            deviceState: {
-              batteryLevel: freshBattery.level,
-              isCharging: freshBattery.charging,
-              isNativeAndroid: isNativeAndroidRuntime(),
-              isDeviceAdminActive: deviceAdminActive,
-              flashlightOn,
-            },
-          }),
-        });
-
-        if (!ok || !data.reply) {
-          throw new Error(data.error || `সার্ভার ত্রুটি (${status})`);
+            memories: settings.memoryEnabled ? memories : [],
+          });
+          await applyAssistantResponse(
+            trimmed,
+            localRes.reply,
+            localRes.language,
+            localRes.toolActions,
+            freshBattery
+          );
+          return;
         }
 
-        const replyLang: LanguageCode = data.language === "hi" ? "hi" : "bn";
-        await applyAssistantResponse(
-          trimmed,
-          data.reply,
-          replyLang,
-          data.toolActions,
-          freshBattery,
-          data.audioBase64
-        );
-      } catch (err) {
-        setVisualState("idle");
-        const errMsg =
-          err instanceof Error ? err.message : "উত্তর তৈরিতে সমস্যা হয়েছে। আবার চেষ্টা করুন।";
-        setErrorBanner(errMsg);
+        // ONLINE MODE: Call Gemini AI Brain via secure backend
+        try {
+          const { ok, status, data } = await fetchApiJson<{
+            reply?: string;
+            language?: LanguageCode;
+            toolActions?: Array<{ id: string; name: string; args: Record<string, unknown> }>;
+            audioBase64?: string;
+            error?: string;
+          }>("/api/assistant/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: trimmed,
+              preferredLanguage: settings.language,
+              inlineFemaleTts: !settings.preferNeuralTts,
+              history: messages.slice(-8).map((m) => ({
+                role: m.role,
+                text: m.text,
+              })),
+              memories: settings.memoryEnabled ? memories : [],
+              contacts,
+              deviceState: {
+                batteryLevel: freshBattery.level,
+                isCharging: freshBattery.charging,
+                isNativeAndroid: isNativeAndroidRuntime(),
+                isDeviceAdminActive: deviceAdminActive,
+                flashlightOn,
+              },
+            }),
+          });
+
+          if (!ok || !data.reply) {
+            throw new Error(data.error || `সার্ভার ত্রুটি (${status})`);
+          }
+
+          const replyLang: LanguageCode =
+            data.language === "hi" ? "hi" : data.language === "en" ? "en" : "bn";
+          await applyAssistantResponse(
+            trimmed,
+            data.reply,
+            replyLang,
+            data.toolActions,
+            freshBattery,
+            data.audioBase64
+          );
+        } catch (err) {
+          // If internet dropped mid-request, seamlessly run Local Offline Brain!
+          if (!navigator.onLine) {
+            const localRes = evaluateLocalOfflineCommand({
+              utterance: trimmed,
+              preferredLanguage: settings.language,
+              battery: freshBattery,
+              flashlightOn,
+              contacts,
+              memories: settings.memoryEnabled ? memories : [],
+            });
+            await applyAssistantResponse(
+              trimmed,
+              localRes.reply,
+              localRes.language,
+              localRes.toolActions,
+              freshBattery
+            );
+            return;
+          }
+          setVisualState("idle");
+          const errMsg =
+            err instanceof Error ? err.message : "উত্তর তৈরিতে সমস্যা হয়েছে। আবার চেষ্টা করুন।";
+          setErrorBanner(errMsg);
+          resumeAlwaysActiveAfterTurn();
+        }
+      } finally {
+        turnInFlightRef.current = false;
       }
     },
     [
@@ -878,9 +1224,9 @@ export default function App() {
       contacts,
       deviceAdminActive,
       flashlightOn,
-      isOnline,
       memories,
       messages,
+      resumeAlwaysActiveAfterTurn,
       settings.language,
       settings.memoryEnabled,
       settings.preferNeuralTts,
@@ -888,8 +1234,140 @@ export default function App() {
     ]
   );
 
+  // Wire Web Local Wake-Word Controller when running in Browser / Preview
+  useEffect(() => {
+    if (isNativeAndroidRuntime()) return;
+    const ctrl = webWakeControllerRef.current;
+    if (!ctrl) return;
+
+    ctrl.configure({
+      language: settings.language,
+      wakeWord: settings.wakeWord,
+      onStageChange: (stage, statusMessage, interim) => {
+        setAlwaysActiveStatus((prev) => ({
+          ...prev,
+          enabled: settings.alwaysActiveVoice,
+          running: stage !== "off" && stage !== "paused_permission",
+          stage,
+          mode: navigator.onLine ? "online" : "offline",
+          wakeWord: settings.wakeWord || "Janu",
+          statusMessage,
+        }));
+        if (typeof interim === "string") {
+          setInterimTranscript(interim);
+        } else if (stage === "wake_standby") {
+          setInterimTranscript("");
+        }
+      },
+      onWakeCommand: (cmd) => {
+        setInterimTranscript("");
+        processUserUtterance(cmd, settings.language);
+      },
+      onPermissionRevoked: () => {
+        setMicPermission("denied");
+      },
+    });
+
+    if (settings.alwaysActiveVoice) {
+      ctrl.start();
+    } else {
+      ctrl.stop();
+    }
+  }, [processUserUtterance, settings.alwaysActiveVoice, settings.language, settings.wakeWord]);
+
+  // Cleanup on unmount only
+  useEffect(() => {
+    return () => {
+      webWakeControllerRef.current?.stop();
+      voiceEngineRef.current?.cancelListening();
+      voiceEngineRef.current?.stopSpeaking();
+    };
+  }, []);
+
   // =========================================================================
-  // SINGLE-PASS MICROPHONE CAPTURE -> VOICE TURN (~1.3s END-TO-END)
+  // PERMANENT ALWAYS ACTIVE ON/OFF SWITCH HANDLER
+  // =========================================================================
+  const handleToggleAlwaysActive = useCallback(
+    async (enable: boolean) => {
+      voiceEngineRef.current?.unlockAudioOnGesture();
+
+      if (!enable) {
+        updateSettings({ alwaysActiveVoice: false });
+        webWakeControllerRef.current?.stop();
+        voiceEngineRef.current?.cancelListening();
+        setVisualState((s) => (s === "listening" ? "idle" : s));
+        if (isNativeAndroidRuntime()) {
+          const st = await setNativeAlwaysActiveService({
+            enabled: false,
+            language: settings.language,
+            wakeWord: settings.wakeWord,
+            speechSpeed: settings.speechSpeed,
+            voiceName: settings.voiceName,
+            contacts,
+            memories,
+            messages,
+            isOnline,
+          });
+          if (st) setAlwaysActiveStatus(st);
+        } else {
+          setAlwaysActiveStatus((prev) => ({
+            ...prev,
+            enabled: false,
+            running: false,
+            stage: "off",
+            statusMessage: "",
+          }));
+        }
+        return;
+      }
+
+      // Turning ON: Verify / request Microphone permission explicitly first
+      if (isNativeAndroidRuntime()) {
+        updateSettings({ alwaysActiveVoice: true });
+        const st = await setNativeAlwaysActiveService({
+          enabled: true,
+          language: settings.language,
+          wakeWord: settings.wakeWord,
+          speechSpeed: settings.speechSpeed,
+          voiceName: settings.voiceName,
+          contacts,
+          memories: settings.memoryEnabled ? memories : [],
+          messages,
+          isOnline,
+        });
+        if (st) {
+          setAlwaysActiveStatus(st);
+          setMicPermission(st.micPermissionGranted ? "granted" : "denied");
+        }
+        return;
+      }
+
+      const permRes = await requestExplicitMicrophoneAccess();
+      setMicPermission(permRes.state);
+      if (permRes.state !== "granted") {
+        if (permRes.error) setErrorBanner(permRes.error);
+        return;
+      }
+
+      updateSettings({ alwaysActiveVoice: true });
+      webWakeControllerRef.current?.start();
+    },
+    [
+      contacts,
+      isOnline,
+      memories,
+      messages,
+      settings.language,
+      settings.memoryEnabled,
+      settings.speechSpeed,
+      settings.voiceName,
+      settings.wakeWord,
+      updateSettings,
+    ]
+  );
+
+  // =========================================================================
+  // MANUAL MICROPHONE BUTTON CAPTURE (Coordinates cleanly with Always Active)
   // =========================================================================
   const finishActiveMicCapture = useCallback(async () => {
     if (!voiceEngineRef.current || finishingMicRef.current) return;
@@ -906,14 +1384,33 @@ export default function App() {
         setErrorBanner(
           settings.language === "bn"
             ? "কোনো কথা শোনা যায়নি। মাইক বাটনে ট্যাপ করে স্পষ্টভাবে বলুন।"
-            : "कोई आवाज़ नहीं मिली। माइक दबाकर स्पष्ट रूप से बोलें।"
+            : settings.language === "hi"
+            ? "कोई आवाज़ नहीं मिली। माइक दबाकर स्पष्ट रूप से बोलें।"
+            : "No speech detected. Please speak clearly."
         );
+        resumeAlwaysActiveAfterTurn();
         return;
       }
 
-      // If browser captured text only without audio bytes
       if (!payload.audioBase64 && payload.webFallbackTranscript) {
         await processUserUtterance(payload.webFallbackTranscript, settings.language);
+        return;
+      }
+
+      if (!navigator.onLine) {
+        if (payload.webFallbackTranscript) {
+          await processUserUtterance(payload.webFallbackTranscript, settings.language);
+          return;
+        }
+        setVisualState("idle");
+        setErrorBanner(
+          settings.language === "bn"
+            ? "অফলাইন মোডে লোকাল কমান্ডের জন্য Always Active ব্যবহার করুন অথবা নিচে কমান্ড লিখুন।"
+            : settings.language === "hi"
+            ? "ऑफ़लाइन मोड में लोकल कमांड के लिए Always Active चालू करें या नीचे लिखें।"
+            : "In Offline Mode, use Always Active Wake Word or type your local command below."
+        );
+        resumeAlwaysActiveAfterTurn();
         return;
       }
 
@@ -965,15 +1462,18 @@ export default function App() {
         setVisualState("idle");
         setErrorBanner(
           settings.language === "bn"
-            ? "স্পষ্ট কথা শোনা যায়নি। অনুগ্রহ করে আবার মাইক ট্যাপ করে বলুন।"
-            : "स्पष्ट आवाज़ सुनाई नहीं दी। कृपया माइक टैप करके फिर से बोलें।"
+            ? "স্পষ্ট কথা শোনা যায়নি। অনুগ্রহ করে আবার বলুন।"
+            : settings.language === "hi"
+            ? "स्पष्ट आवाज़ सुनाई नहीं दी। कृपया फिर से बोलें।"
+            : "Could not hear clear speech. Please try again."
         );
+        resumeAlwaysActiveAfterTurn();
         return;
       }
 
-      const replyLang: LanguageCode = data.language === "hi" ? "hi" : "bn";
+      const replyLang: LanguageCode =
+        data.language === "hi" ? "hi" : data.language === "en" ? "en" : "bn";
 
-      // First check if user spoke "হ্যাঁ" / "না" / 4-digits for an active PendingAction
       const handledPending = await tryHandlePendingConfirmation(transcript, replyLang);
       if (handledPending) {
         return;
@@ -994,6 +1494,7 @@ export default function App() {
       setErrorBanner(
         err instanceof Error ? err.message : "ভয়েস চিনতে সমস্যা হয়েছে। আবার চেষ্টা করুন।"
       );
+      resumeAlwaysActiveAfterTurn();
     } finally {
       finishingMicRef.current = false;
     }
@@ -1006,6 +1507,7 @@ export default function App() {
     memories,
     messages,
     processUserUtterance,
+    resumeAlwaysActiveAfterTurn,
     settings.language,
     settings.memoryEnabled,
     settings.preferNeuralTts,
@@ -1023,6 +1525,12 @@ export default function App() {
     }
 
     setErrorBanner(null);
+
+    // Temporarily yield Always Active wake-word recognizer so manual mic gets exclusive hardware access
+    webWakeControllerRef.current?.pauseForTurnProcessing();
+    if (isNativeAndroidRuntime()) {
+      await PiyaNativePlugin.yieldServiceMic({ pause: true }).catch(() => {});
+    }
 
     try {
       setInterimTranscript("");
@@ -1043,23 +1551,27 @@ export default function App() {
         setMicPermission("denied");
       }
       setErrorBanner(msg);
+      resumeAlwaysActiveAfterTurn();
     }
-  }, [finishActiveMicCapture, settings.language, visualState]);
+  }, [finishActiveMicCapture, resumeAlwaysActiveAfterTurn, settings.language, visualState]);
 
   const handleCancelMic = useCallback(() => {
     voiceEngineRef.current?.cancelListening();
     setInterimTranscript("");
     setMicLevel(0);
     setVisualState("idle");
-  }, []);
+    resumeAlwaysActiveAfterTurn();
+  }, [resumeAlwaysActiveAfterTurn]);
 
   const handleStopSpeaking = useCallback(() => {
     voiceEngineRef.current?.stopSpeaking();
     setLipSync({ mouthOpen: 0, mouthSpread: 0.35, energy: 0 });
     setVisualState("idle");
-  }, []);
+    resumeAlwaysActiveAfterTurn();
+  }, [resumeAlwaysActiveAfterTurn]);
 
   const handleResetAllData = useCallback(() => {
+    handleToggleAlwaysActive(false);
     Object.values(STORAGE_KEYS).forEach((k) => window.localStorage.removeItem(k));
     setMemories([]);
     setMessages([]);
@@ -1068,23 +1580,31 @@ export default function App() {
     setContacts(DEFAULT_CONTACTS);
     setSettings(DEFAULT_SETTINGS);
     setActionStatusToast(
-      settings.language === "bn" ? "সব সংরক্ষিত ডেটা মুছে ফেলা হয়েছে।" : "सारा डेटा हटा दिया गया है।"
+      settings.language === "bn"
+        ? "সব সংরক্ষিত ডেটা মুছে ফেলা হয়েছে।"
+        : settings.language === "hi"
+        ? "सारा डेटा हटा दिया गया है।"
+        : "All saved data has been cleared."
     );
-  }, [settings.language]);
+  }, [handleToggleAlwaysActive, settings.language]);
 
   const copy = UI_COPY[settings.language];
 
-  const voiceStatusText = !isOnline
-    ? copy.offlineMode
-    : micPermission === "denied"
-    ? copy.micDenied
-    : visualState === "listening"
-    ? copy.voiceListening
-    : visualState === "thinking"
-    ? copy.voiceThinking
-    : visualState === "speaking"
-    ? copy.voiceSpeaking
-    : copy.voiceReady;
+  const voiceStatusText =
+    micPermission === "denied"
+      ? copy.micDenied
+      : visualState === "listening"
+      ? copy.voiceListening
+      : visualState === "thinking"
+      ? copy.voiceThinking
+      : visualState === "speaking"
+      ? copy.voiceSpeaking
+      : settings.alwaysActiveVoice
+      ? alwaysActiveStatus.statusMessage ||
+        (!isOnline ? copy.offlineLocalActive : copy.voiceWakeStandby)
+      : !isOnline
+      ? copy.offlineMode
+      : copy.voiceReady;
 
   return (
     <div className="min-h-screen flex flex-col bg-[var(--piya-bg)] text-slate-100">
@@ -1103,12 +1623,12 @@ export default function App() {
             onClick={() => setRingingAlarm(null)}
             className="min-h-[38px] px-4 rounded-lg bg-slate-950 text-white text-xs font-semibold whitespace-nowrap shrink-0"
           >
-            বন্ধ করুন
+            {settings.language === "bn" ? "বন্ধ করুন" : settings.language === "hi" ? "बंद करें" : "Dismiss"}
           </button>
         </div>
       )}
 
-      {/* Clean Top Bar (Brand — 3 Navigation Tabs — Start CTA) */}
+      {/* Clean Top Bar */}
       <header className="sticky top-0 z-30 flex items-center justify-between gap-4 px-4 sm:px-8 h-16 border-b border-[var(--piya-border)] bg-[#060b18]/95">
         <button
           type="button"
@@ -1151,6 +1671,24 @@ export default function App() {
         <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
+            onClick={() => handleToggleAlwaysActive(!settings.alwaysActiveVoice)}
+            className={`min-h-[40px] px-3 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+              settings.alwaysActiveVoice
+                ? "border-[var(--piya-accent)] bg-[var(--piya-accent-soft)] text-white"
+                : "border-slate-800 bg-[#0b1326] text-slate-300 hover:text-white"
+            }`}
+            title={copy.alwaysActiveTitle}
+          >
+            <Radio
+              className="w-4 h-4"
+              style={settings.alwaysActiveVoice ? { color: "var(--piya-accent-bright)" } : undefined}
+            />
+            <span className="hidden sm:inline">Always Active</span>
+            <span>{settings.alwaysActiveVoice ? "ON" : "OFF"}</span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => setProfileOpen(true)}
             className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-xl border border-slate-800 bg-[#0b1326] text-slate-200 hover:text-white transition-colors"
             aria-label="Profile"
@@ -1182,11 +1720,21 @@ export default function App() {
       <main className="flex-1 w-full max-w-6xl mx-auto px-4 sm:px-8 py-5 pb-24 md:pb-10">
         {activeTab === "home" && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
-            {/* Official PIYA AI Main Character Stage (Shown First on Mobile for Immediate Presence) */}
+            {/* Official Character Stage */}
             <div className="lg:col-span-6 lg:order-2 rounded-3xl border border-[var(--piya-border)] bg-[#02050d] h-[440px] sm:h-[540px] lg:h-[600px] flex flex-col overflow-hidden relative">
               <div className="flex-1 min-h-0">
                 <PiyaCharacter3D
-                  visualState={visualState}
+                  visualState={
+                    visualState !== "idle"
+                      ? visualState
+                      : alwaysActiveStatus.stage === "capturing_command"
+                      ? "listening"
+                      : alwaysActiveStatus.stage === "processing"
+                      ? "thinking"
+                      : alwaysActiveStatus.stage === "speaking"
+                      ? "speaking"
+                      : "idle"
+                  }
                   themeId={settings.theme}
                   lipSync={lipSync}
                   micLevel={micLevel}
@@ -1195,10 +1743,10 @@ export default function App() {
               </div>
             </div>
 
-            {/* Clean Main Controls Card */}
+            {/* Main Controls Card */}
             <div className="lg:col-span-6 lg:order-1 flex flex-col justify-between space-y-6 rounded-3xl border border-[var(--piya-border)] bg-[var(--piya-surface)] p-5 sm:p-8">
               <div className="space-y-5">
-                {/* Voice Status Indicator */}
+                {/* Live Voice Status Text */}
                 <div className="text-xs font-semibold" style={{ color: "var(--piya-accent-bright)" }}>
                   {voiceStatusText}
                 </div>
@@ -1216,31 +1764,60 @@ export default function App() {
                   </p>
                 </div>
 
-                {/* Language Switch & 5 Theme Swatches */}
+                {/* Permanent Always Active Quick Card */}
+                <div className="rounded-2xl border border-[var(--piya-border)] bg-[#060c1a] p-3.5 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold text-white">
+                      {copy.alwaysActiveTitle}
+                    </div>
+                    <div className="text-[11px] text-slate-400 truncate mt-0.5">
+                      {settings.alwaysActiveVoice
+                        ? copy.alwaysActiveOnLabel
+                        : copy.alwaysActiveOffLabel}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={settings.alwaysActiveVoice}
+                    onClick={() => handleToggleAlwaysActive(!settings.alwaysActiveVoice)}
+                    className={`relative inline-flex h-7 w-12 shrink-0 items-center rounded-full border transition-colors ${
+                      settings.alwaysActiveVoice
+                        ? "bg-[var(--piya-accent)] border-[var(--piya-accent-bright)]"
+                        : "bg-slate-800 border-slate-700"
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform ${
+                        settings.alwaysActiveVoice ? "translate-x-6" : "translate-x-1"
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                {/* Language Switch (বাংলা · हिन्दी · English) & 5 Theme Swatches */}
                 <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
                   <div className="flex items-center gap-1 p-1 rounded-xl bg-[#060c1a] border border-slate-800">
-                    <button
-                      type="button"
-                      onClick={() => updateSettings({ language: "bn" })}
-                      className={`min-h-[38px] px-4 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
-                        settings.language === "bn"
-                          ? "bg-[var(--piya-accent)] text-[var(--piya-on-accent)]"
-                          : "text-slate-300 hover:text-white"
-                      }`}
-                    >
-                      বাংলা
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => updateSettings({ language: "hi" })}
-                      className={`min-h-[38px] px-4 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
-                        settings.language === "hi"
-                          ? "bg-[var(--piya-accent)] text-[var(--piya-on-accent)]"
-                          : "text-slate-300 hover:text-white"
-                      }`}
-                    >
-                      हिन्दी
-                    </button>
+                    {(
+                      [
+                        { code: "bn" as LanguageCode, label: "বাংলা" },
+                        { code: "hi" as LanguageCode, label: "हिन्दी" },
+                        { code: "en" as LanguageCode, label: "English" },
+                      ] as const
+                    ).map((langOpt) => (
+                      <button
+                        key={langOpt.code}
+                        type="button"
+                        onClick={() => updateSettings({ language: langOpt.code })}
+                        className={`min-h-[38px] px-3.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                          settings.language === langOpt.code
+                            ? "bg-[var(--piya-accent)] text-[var(--piya-on-accent)]"
+                            : "text-slate-300 hover:text-white"
+                        }`}
+                      >
+                        {langOpt.label}
+                      </button>
+                    ))}
                   </div>
 
                   <div className="flex items-center gap-2">
@@ -1375,7 +1952,9 @@ export default function App() {
                 explanation:
                   settings.language === "bn"
                     ? `${tStr} সময়ে "${label}" অ্যালার্ম সেট করতে চান?`
-                    : `क्या आप ${tStr} बजे के लिए "${label}" अलार्म सेट करना चाहते हैं?`,
+                    : settings.language === "hi"
+                    ? `क्या आप ${tStr} बजे के लिए "${label}" अलार्म सेट करना चाहते हैं?`
+                    : `Set alarm "${label}" for ${tStr}?`,
                 alarmData: { hour, minute, label },
               });
               setFullScreenAssistant(true);
@@ -1421,11 +2000,18 @@ export default function App() {
               setPendingAction({
                 id: `pa_${Date.now()}`,
                 type: "lock_phone",
-                title: settings.language === "bn" ? "ফোন স্ক্রিন লক" : "फ़ोन स्क्रीन लॉक",
+                title:
+                  settings.language === "bn"
+                    ? "ফোন স্ক্রিন লক"
+                    : settings.language === "hi"
+                    ? "फ़ोन स्क्रीन लॉक"
+                    : "Lock Phone Screen",
                 explanation:
                   settings.language === "bn"
                     ? "জানু এআই ফোন লক করবে। নিশ্চিত করতে চান?"
-                    : "जानू एआई फ़ोन लॉक करेगी। क्या आप पुष्टि करते हैं?",
+                    : settings.language === "hi"
+                    ? "जानू एआई फ़ोन लॉक करेगी। क्या आप पुष्टि करते हैं?"
+                    : "Janu AI will lock your phone screen. Confirm?",
               });
               setFullScreenAssistant(true);
             }}
@@ -1494,6 +2080,8 @@ export default function App() {
           language={settings.language}
           themeId={settings.theme}
           visualState={visualState}
+          alwaysActiveVoice={settings.alwaysActiveVoice}
+          alwaysActiveStatus={alwaysActiveStatus}
           micPermission={micPermission}
           isOnline={isOnline}
           lipSync={lipSync}
@@ -1507,9 +2095,11 @@ export default function App() {
             voiceEngineRef.current?.cancelListening();
             setVisualState((s) => (s === "listening" ? "idle" : s));
             setFullScreenAssistant(false);
+            resumeAlwaysActiveAfterTurn();
           }}
           onOpenSettings={() => setSettingsOpen(true)}
           onChangeLanguage={(lang) => updateSettings({ language: lang })}
+          onToggleAlwaysActive={handleToggleAlwaysActive}
           onToggleMic={handleToggleMic}
           onCancelMic={handleCancelMic}
           onStopSpeaking={handleStopSpeaking}
@@ -1525,21 +2115,42 @@ export default function App() {
       <SettingsModal
         open={settingsOpen}
         settings={settings}
+        alwaysActiveStatus={alwaysActiveStatus}
         micPermission={micPermission}
         memoriesCount={memories.length}
         onClose={() => setSettingsOpen(false)}
         onUpdateSettings={updateSettings}
+        onToggleAlwaysActive={handleToggleAlwaysActive}
+        onRequestBatteryExemption={async () => {
+          if (isNativeAndroidRuntime()) {
+            const res = await PiyaNativePlugin.requestIgnoreBatteryOptimizations();
+            setAlwaysActiveStatus((prev) => ({
+              ...prev,
+              batteryOptimizationIgnored: res.batteryOptimizationIgnored,
+            }));
+          }
+        }}
+        onOpenSystemAppPermissions={() => {
+          if (isNativeAndroidRuntime()) {
+            PiyaNativePlugin.openAppPermissionSettings().catch(() => {});
+          }
+        }}
         onRequestMicPermission={async () => {
           const res = await requestExplicitMicrophoneAccess();
           setMicPermission(res.state);
           if (res.error) setErrorBanner(res.error);
+          else if (res.state === "granted" && settings.alwaysActiveVoice) {
+            handleToggleAlwaysActive(true);
+          }
         }}
         onTestVoiceSample={() => {
           voiceEngineRef.current?.unlockAudioOnGesture();
           const sample =
             settings.language === "bn"
-              ? "নমস্কার, আমি জানু এআই। আমি দ্রুত আপনার কথা শুনতে ও সাহায্য করতে প্রস্তুত।"
-              : "नमस्ते, मैं जानू एआई हूँ। मैं तुरंत आपकी मदद करने के लिए तैयार हूँ।";
+              ? "নমস্কার, আমি জানু এআই। আমি আপনার কথা শুনতে ও সাহায্য করতে সদা প্রস্তুত।"
+              : settings.language === "hi"
+              ? "नमस्ते, मैं जानू एआई हूँ। मैं आपकी मदद करने के लिए हमेशा तैयार हूँ।"
+              : "Hello, I am Janu AI. I am ready to listen and help you anytime.";
           speakAssistantReply(sample, settings.language);
         }}
         onClearMemories={() => setMemories([])}

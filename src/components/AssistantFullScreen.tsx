@@ -10,6 +10,7 @@ import {
   Mic,
   MicOff,
   Phone,
+  Radio,
   Send,
   Settings,
   Trash2,
@@ -17,6 +18,7 @@ import {
   X,
 } from "lucide-react";
 import type {
+  AlwaysActiveStatus,
   AssistantVisualState,
   ChatMessage,
   ContactItem,
@@ -32,6 +34,8 @@ interface AssistantFullScreenProps {
   language: LanguageCode;
   themeId: ThemeId;
   visualState: AssistantVisualState;
+  alwaysActiveVoice: boolean;
+  alwaysActiveStatus: AlwaysActiveStatus;
   micPermission: MicPermissionState;
   isOnline: boolean;
   lipSync: LipSyncFrame;
@@ -44,6 +48,7 @@ interface AssistantFullScreenProps {
   onBackToHome: () => void;
   onOpenSettings: () => void;
   onChangeLanguage: (lang: LanguageCode) => void;
+  onToggleAlwaysActive: (enabled: boolean) => void;
   onToggleMic: () => void;
   onCancelMic: () => void;
   onStopSpeaking: () => void;
@@ -58,6 +63,8 @@ export const AssistantFullScreen: React.FC<AssistantFullScreenProps> = ({
   language,
   themeId,
   visualState,
+  alwaysActiveVoice,
+  alwaysActiveStatus,
   micPermission,
   isOnline,
   lipSync,
@@ -70,6 +77,7 @@ export const AssistantFullScreen: React.FC<AssistantFullScreenProps> = ({
   onBackToHome,
   onOpenSettings,
   onChangeLanguage,
+  onToggleAlwaysActive,
   onToggleMic,
   onCancelMic,
   onStopSpeaking,
@@ -89,17 +97,21 @@ export const AssistantFullScreen: React.FC<AssistantFullScreenProps> = ({
     .reverse()
     .find((m) => m.role === "assistant" && !m.isError);
 
-  const statusLabel = !isOnline
-    ? copy.offlineMode
-    : micPermission === "denied"
-    ? copy.micDenied
-    : visualState === "listening"
-    ? copy.voiceListening
-    : visualState === "thinking"
-    ? copy.voiceThinking
-    : visualState === "speaking"
-    ? copy.voiceSpeaking
-    : copy.voiceReady;
+  const statusLabel =
+    micPermission === "denied"
+      ? copy.micDenied
+      : visualState === "listening"
+      ? copy.voiceListening
+      : visualState === "thinking"
+      ? copy.voiceThinking
+      : visualState === "speaking"
+      ? copy.voiceSpeaking
+      : alwaysActiveVoice
+      ? alwaysActiveStatus.statusMessage ||
+        (!isOnline ? copy.offlineLocalActive : copy.voiceWakeStandby)
+      : !isOnline
+      ? copy.offlineMode
+      : copy.voiceReady;
 
   const handleFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -123,7 +135,7 @@ export const AssistantFullScreen: React.FC<AssistantFullScreenProps> = ({
 
   return (
     <div className="fixed inset-0 z-40 flex flex-col bg-[var(--piya-bg)] text-slate-100 overflow-hidden">
-      {/* Clean Mobile-Ergonomic Header (No cramped/truncated status text) */}
+      {/* Header */}
       <header className="relative z-30 flex items-center justify-between gap-2 px-3 sm:px-5 h-14 border-b border-[var(--piya-border)] bg-[#060b18]/95">
         <div className="flex items-center gap-2 shrink-0">
           <button
@@ -145,29 +157,46 @@ export const AssistantFullScreen: React.FC<AssistantFullScreenProps> = ({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
+          {/* Quick Hands-Free Always Active Toggle */}
+          <button
+            type="button"
+            onClick={() => onToggleAlwaysActive(!alwaysActiveVoice)}
+            className={`min-h-[34px] px-2.5 rounded-lg border text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+              alwaysActiveVoice
+                ? "border-[var(--piya-accent)] bg-[var(--piya-accent-soft)] text-white"
+                : "border-slate-800 bg-[#0d162c] text-slate-400 hover:text-white"
+            }`}
+            title="Always Active Voice Assistant"
+          >
+            <Radio
+              className="w-3.5 h-3.5"
+              style={alwaysActiveVoice ? { color: "var(--piya-accent-bright)" } : undefined}
+            />
+            <span className="hidden sm:inline">Always Active</span>
+            <span>{alwaysActiveVoice ? "ON" : "OFF"}</span>
+          </button>
+
           <div className="flex items-center p-0.5 rounded-lg bg-[#0d162c] border border-[var(--piya-border)]">
-            <button
-              type="button"
-              onClick={() => onChangeLanguage("bn")}
-              className={`min-h-[34px] px-2.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                language === "bn"
-                  ? "bg-[var(--piya-accent)] text-[var(--piya-on-accent)]"
-                  : "text-slate-300 hover:text-white"
-              }`}
-            >
-              বাংলা
-            </button>
-            <button
-              type="button"
-              onClick={() => onChangeLanguage("hi")}
-              className={`min-h-[34px] px-2.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                language === "hi"
-                  ? "bg-[var(--piya-accent)] text-[var(--piya-on-accent)]"
-                  : "text-slate-300 hover:text-white"
-              }`}
-            >
-              हिन्दी
-            </button>
+            {(
+              [
+                { code: "bn" as LanguageCode, label: "বাংলা" },
+                { code: "hi" as LanguageCode, label: "हिन्दी" },
+                { code: "en" as LanguageCode, label: "EN" },
+              ] as const
+            ).map((l) => (
+              <button
+                key={l.code}
+                type="button"
+                onClick={() => onChangeLanguage(l.code)}
+                className={`min-h-[34px] px-2 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                  language === l.code
+                    ? "bg-[var(--piya-accent)] text-[var(--piya-on-accent)]"
+                    : "text-slate-300 hover:text-white"
+                }`}
+              >
+                {l.label}
+              </button>
+            ))}
           </div>
 
           <button
@@ -208,10 +237,20 @@ export const AssistantFullScreen: React.FC<AssistantFullScreenProps> = ({
         </div>
       )}
 
-      {/* Unobstructed Full-Body Character Stage (Head-to-Toe Intact) */}
+      {/* Unobstructed Full-Body Character Stage */}
       <main className="relative flex-1 min-h-0 w-full">
         <PiyaCharacter3D
-          visualState={visualState}
+          visualState={
+            visualState !== "idle"
+              ? visualState
+              : alwaysActiveStatus.stage === "capturing_command"
+              ? "listening"
+              : alwaysActiveStatus.stage === "processing"
+              ? "thinking"
+              : alwaysActiveStatus.stage === "speaking"
+              ? "speaking"
+              : "idle"
+          }
           themeId={themeId}
           lipSync={lipSync}
           micLevel={micLevel}
@@ -229,12 +268,20 @@ export const AssistantFullScreen: React.FC<AssistantFullScreenProps> = ({
             {dockCollapsed ? (
               <>
                 <ChevronUp className="w-3.5 h-3.5" />
-                <span>{language === "bn" ? "কন্ট্রোল দেখান" : "कंट्रोल दिखाएँ"}</span>
+                <span>
+                  {language === "bn"
+                    ? "কন্ট্রোল দেখান"
+                    : language === "hi"
+                    ? "कंट्रोल दिखाएँ"
+                    : "Show Controls"}
+                </span>
               </>
             ) : (
               <>
                 <ChevronDown className="w-3.5 h-3.5" />
-                <span>{language === "bn" ? "লুকান" : "छुपाएँ"}</span>
+                <span>
+                  {language === "bn" ? "লুকান" : language === "hi" ? "छुपाएँ" : "Hide"}
+                </span>
               </>
             )}
           </button>
@@ -322,7 +369,11 @@ export const AssistantFullScreen: React.FC<AssistantFullScreenProps> = ({
                         value={digitFilter}
                         onChange={(e) => setDigitFilter(e.target.value)}
                         placeholder={
-                          language === "bn" ? "শেষ ৪ ডিজিট (যেমন 4821)" : "आखिरी 4 अंक (जैसे 4821)"
+                          language === "bn"
+                            ? "শেষ ৪ ডিজিট (যেমন 4821)"
+                            : language === "hi"
+                            ? "आखिरी 4 अंक (जैसे 4821)"
+                            : "Last 4 digits (e.g. 4821)"
                         }
                         className="flex-1 min-h-[40px] px-3 rounded-lg bg-[#060b18] border border-[var(--piya-border)] text-xs text-white placeholder:text-slate-500 font-mono-tabular focus:outline-none focus:border-[var(--piya-accent)]"
                       />
@@ -383,7 +434,8 @@ export const AssistantFullScreen: React.FC<AssistantFullScreenProps> = ({
 
             {/* Live Transcript or Latest Assistant Reply */}
             <div className="rounded-xl bg-[#0b152b] border border-slate-800/80 px-3.5 py-2.5 max-h-24 overflow-y-auto">
-              {visualState === "listening" && interimTranscript ? (
+              {(visualState === "listening" || alwaysActiveStatus.stage === "capturing_command") &&
+              interimTranscript ? (
                 <p className="text-sm text-cyan-200 leading-relaxed">{interimTranscript}</p>
               ) : latestSpokenReply ? (
                 <p className="text-sm text-slate-100 leading-relaxed">{latestSpokenReply.text}</p>
@@ -392,12 +444,12 @@ export const AssistantFullScreen: React.FC<AssistantFullScreenProps> = ({
               )}
             </div>
 
-            {/* Primary Voice & Text Controls */}
+            {/* Primary Voice & Text Controls (Works both Online & Offline!) */}
             <div className="flex items-center gap-2">
               <button
                 type="button"
                 onClick={onToggleMic}
-                disabled={!isOnline || visualState === "thinking"}
+                disabled={visualState === "thinking"}
                 className={`min-h-[50px] px-4 rounded-xl font-semibold text-xs flex items-center justify-center gap-1.5 transition-transform active:scale-95 whitespace-nowrap shrink-0 ${
                   visualState === "listening"
                     ? "bg-rose-500 text-white shadow-lg shadow-rose-500/30"
@@ -423,7 +475,7 @@ export const AssistantFullScreen: React.FC<AssistantFullScreenProps> = ({
                 )}
               </button>
 
-              {visualState === "speaking" && (
+              {(visualState === "speaking" || alwaysActiveStatus.stage === "speaking") && (
                 <button
                   type="button"
                   onClick={onStopSpeaking}
@@ -440,12 +492,12 @@ export const AssistantFullScreen: React.FC<AssistantFullScreenProps> = ({
                   value={inputValue}
                   onChange={(e) => setInputValue(e.target.value)}
                   placeholder={copy.typePlaceholder}
-                  disabled={!isOnline || visualState === "thinking"}
+                  disabled={visualState === "thinking"}
                   className="w-full min-h-[50px] px-3 rounded-xl bg-[#050a16] border border-slate-800 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:border-[var(--piya-accent)] disabled:opacity-50"
                 />
                 <button
                   type="submit"
-                  disabled={!isOnline || !inputValue.trim() || visualState === "thinking"}
+                  disabled={!inputValue.trim() || visualState === "thinking"}
                   className="min-h-[50px] min-w-[48px] rounded-xl border border-[var(--piya-border)] bg-[#0d1830] text-slate-200 hover:text-white disabled:opacity-40 flex items-center justify-center shrink-0 transition-colors"
                   aria-label="Send"
                 >
@@ -457,13 +509,17 @@ export const AssistantFullScreen: React.FC<AssistantFullScreenProps> = ({
         )}
       </section>
 
-      {/* Conversation History Drawer */}
+      {/* Shared Conversation History Drawer (Voice + Background + Text) */}
       {historyOpen && (
         <div className="fixed inset-0 z-50 flex justify-end bg-black/70">
           <div className="w-full max-w-md h-full bg-[#080f20] border-l border-[var(--piya-border)] flex flex-col">
             <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800">
               <h2 className="font-display text-base font-semibold text-white">
-                {language === "bn" ? "কথোপকথনের ইতিহাস" : "बातचीत का इतिहास"}
+                {language === "bn"
+                  ? "কথোপকথনের ইতিহাস"
+                  : language === "hi"
+                  ? "बातचीत का इतिहास"
+                  : "Conversation History"}
               </h2>
               <div className="flex items-center gap-2">
                 {messages.length > 0 && (
@@ -473,7 +529,13 @@ export const AssistantFullScreen: React.FC<AssistantFullScreenProps> = ({
                     className="min-h-[38px] px-3 rounded-lg text-xs text-rose-300 hover:bg-rose-500/10 flex items-center gap-1.5 whitespace-nowrap shrink-0"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
-                    <span>{language === "bn" ? "মুছে ফেলুন" : "साफ़ करें"}</span>
+                    <span>
+                      {language === "bn"
+                        ? "মুছে ফেলুন"
+                        : language === "hi"
+                        ? "साफ़ करें"
+                        : "Clear"}
+                    </span>
                   </button>
                 )}
                 <button
@@ -492,7 +554,9 @@ export const AssistantFullScreen: React.FC<AssistantFullScreenProps> = ({
                 <p className="text-xs text-slate-400 text-center py-8">
                   {language === "bn"
                     ? "এখনও কোনো কথোপকথন হয়নি।"
-                    : "अभी तक कोई बातचीत नहीं हुई है।"}
+                    : language === "hi"
+                    ? "अभी तक कोई बातचीत नहीं हुई है।"
+                    : "No conversation turns yet."}
                 </p>
               ) : (
                 messages.map((m) => (
@@ -507,9 +571,23 @@ export const AssistantFullScreen: React.FC<AssistantFullScreenProps> = ({
                     }`}
                   >
                     <div className="text-[11px] text-slate-400 mb-1">
-                      <span>{m.role === "user" ? (language === "bn" ? "আপনি" : "आप") : "Janu AI"}</span>
+                      <span>
+                        {m.role === "user"
+                          ? language === "bn"
+                            ? "আপনি"
+                            : language === "hi"
+                            ? "आप"
+                            : "You"
+                          : "Janu AI"}
+                      </span>
                       <span className="mx-1.5">·</span>
-                      <span>{m.language === "bn" ? "বাংলা" : "हिन्दी"}</span>
+                      <span>
+                        {m.language === "bn"
+                          ? "বাংলা"
+                          : m.language === "hi"
+                          ? "हिन्दी"
+                          : "English"}
+                      </span>
                       {m.actionBadge && (
                         <>
                           <span className="mx-1.5">·</span>

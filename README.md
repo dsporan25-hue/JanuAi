@@ -1,10 +1,10 @@
 # Janu AI — Personal AI Voice Assistant
 
 **Developer:** Poran  
-**Platform:** Android (Capacitor + Native Java Plugin) & Online Web Assistant  
-**Languages:** Bengali (`বাংলা`) & Hindi (`हिन्दी`)
+**Platform:** Android (Capacitor + Native Foreground Microphone Service + Java Plugin) & Online/Offline Web Assistant  
+**Languages:** Bengali (`বাংলা`), Hindi (`हिन्दी`) & English (`English`)
 
-Janu AI is an online, voice-controlled personal AI assistant built with React, TypeScript, Tailwind CSS, Express, Gemini (`@google/genai`), and Capacitor Android. It features Janu AI's official full-body character identity, real-time Bengali and Hindi speech recognition and 100% female voice synthesis, an action confirmation & multi-contact disambiguation system, user-approved memory storage, five customizable themes, and native Android phone control integration.
+Janu AI is a JARVIS-style Always Active personal AI voice assistant built with React, TypeScript, Tailwind CSS, Express, Gemini (`@google/genai`), and Capacitor Android. It features Janu AI's official full-body character identity, a permanent **Always Active Voice Assistant** ON/OFF switch (persisted across app restarts and phone reboots), hands-free Wake-Word listening (`"Hey Janu"`, `"জানু"`, `"जानू"`, or custom wake word), seamless **Online Gemini AI + Offline Local Command** auto-switching, 100% female voice synthesis in Bengali, Hindi, and English, shared voice/text conversation history, command deduplication, user-approved memory storage, five customizable themes, and native Android phone control integration.
 
 ---
 
@@ -13,14 +13,17 @@ Janu AI is an online, voice-controlled personal AI assistant built with React, T
 ```text
 ├── .env.example                                  # Environment variable template (no real keys)
 ├── .github/workflows/build-android-apk.yml       # Automated GitHub Actions Android APK builder
-├── android/                                      # Complete Capacitor Android project + Java plugin
+├── android/                                      # Complete Capacitor Android project + Java services
 │   ├── app/build.gradle                          # Android Gradle config + release signingConfig
 │   └── app/src/main/
-│       ├── AndroidManifest.xml                   # Android permissions, package queries & DeviceAdmin
+│       ├── AndroidManifest.xml                   # Foreground microphone service, boot receiver & permissions
 │       ├── java/com/poran/piyaai/
-│       │   ├── MainActivity.java                 # Capacitor BridgeActivity registering plugin
+│       │   ├── JanuAlwaysActivePrefs.java        # Persistent Always-Active state & background turn queue
+│       │   ├── JanuAlwaysActiveService.java      # Foreground microphone wake-word + online/offline service
+│       │   ├── JanuBootReceiver.java             # Reboot recovery for permanent Always-Active switch
+│       │   ├── MainActivity.java                 # Capacitor BridgeActivity & auto-restore hook
 │       │   ├── PiyaDeviceAdminReceiver.java      # DevicePolicyManager lock receiver
-│       │   └── PiyaDeviceControlPlugin.java      # Native bridge for calls, apps, torch, lock, alarms
+│       │   └── PiyaDeviceControlPlugin.java      # Native bridge for Always-Active, calls, torch, lock, alarms
 │       └── res/xml/device_admin_policies.xml     # Force-lock policy definition
 ├── capacitor.config.ts                           # Capacitor configuration (com.poran.piyaai)
 ├── index.html                                    # App HTML entry point
@@ -29,18 +32,19 @@ Janu AI is an online, voice-controlled personal AI assistant built with React, T
 ├── public/assets/aistudio/                       # Official Janu AI main character image asset
 ├── server.ts                                     # Express backend securing Gemini API calls
 └── src/
-    ├── App.tsx                                   # Main screen & full-screen assistant orchestrator
+    ├── App.tsx                                   # Main screen, Always-Active & assistant orchestrator
     ├── components/
-    │   ├── AssistantFullScreen.tsx               # Full-screen character & confirmation dock
+    │   ├── AssistantFullScreen.tsx               # Full-screen character, Always-Active toggle & dock
     │   ├── MemoryVaultPanel.tsx                  # User-approved preference & history manager
     │   ├── PhoneActionsPanel.tsx                 # Contacts, YouTube, battery, torch, alarms & notes
     │   ├── PiyaCharacter3D.tsx                   # Official full-body character & voice-reactive stage
     │   ├── ProfileModal.tsx                      # User & developer identity, logout & data wipe
-    │   └── SettingsModal.tsx                     # Language, voice, speed, 5 themes & privacy settings
-    ├── constants/themesAndCopy.ts                # 5 themes, Bengali/Hindi strings & voice parser
+    │   └── SettingsModal.tsx                     # Permanent Always-Active switch, wake word, 3 languages & themes
+    ├── constants/themesAndCopy.ts                # 5 themes, BN/HI/EN strings & wake-word parser
     ├── services/
-    │   ├── androidBridge.ts                      # Capacitor & Web hardware action bridge
-    │   └── voiceEngine.ts                        # Microphone capture, STT, neural TTS & lip-sync
+    │   ├── androidBridge.ts                      # Capacitor Always-Active & hardware action bridge
+    │   ├── offlineLocalBrain.ts                  # Offline local command brain (BN/HI/EN)
+    │   └── voiceEngine.ts                        # Microphone capture, wake controller, STT & female TTS
     └── types/piya.ts                             # TypeScript definitions
 ```
 

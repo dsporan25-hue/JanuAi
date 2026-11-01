@@ -10,7 +10,7 @@ import type { Content, Schema } from "@google/genai";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-type SupportedLanguage = "bn" | "hi";
+type SupportedLanguage = "bn" | "hi" | "en";
 
 interface ContactInput {
   id: string;
@@ -102,7 +102,7 @@ function splitTextForFemaleTts(text: string, maxLen = 175): string[] {
 }
 
 /**
- * Synthesizes 100% Female Bengali (bn) or Female Hindi (hi) MP3 audio in ~150-300ms.
+ * Synthesizes 100% Female Bengali (bn), Hindi (hi), or English (en) MP3 audio in ~150-300ms.
  * Never produces a male voice.
  */
 async function synthesizeFastFemaleMp3Base64(
@@ -113,7 +113,7 @@ async function synthesizeFastFemaleMp3Base64(
   if (chunks.length === 0) {
     throw new Error("Empty text for speech synthesis.");
   }
-  const tl = language === "hi" ? "hi" : "bn";
+  const tl = language === "hi" ? "hi" : language === "en" ? "en" : "bn";
   const buffers = await Promise.all(
     chunks.map(async (segment) => {
       const url = `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${tl}&q=${encodeURIComponent(
@@ -155,7 +155,7 @@ function getGenAIClient(): GoogleGenAI {
 }
 
 /**
- * Detects whether user input is explicitly Bengali or Hindi, falling back to preferred language.
+ * Detects whether user input is Bengali, Hindi, or English, falling back to preferred language.
  */
 function detectActiveLanguage(text: string, preferredLanguage: SupportedLanguage): SupportedLanguage {
   const bengaliChars = (text.match(/[\u0980-\u09FF]/g) || []).length;
@@ -199,20 +199,54 @@ function detectActiveLanguage(text: string, preferredLanguage: SupportedLanguage
     "haan",
     "nahi",
   ];
+  const englishMarkers = [
+    "what",
+    "how",
+    "who",
+    "where",
+    "when",
+    "why",
+    "please",
+    "turn on",
+    "turn off",
+    "open",
+    "call",
+    "battery",
+    "flashlight",
+    "alarm",
+    "remember",
+    "hello",
+    "good morning",
+    "good evening",
+    "tell me",
+    "play",
+    "lock",
+  ];
 
   let bnScore = 0;
   let hiScore = 0;
+  let enScore = 0;
   for (const w of romanBengaliMarkers) {
     if (lower.includes(w)) bnScore += 1;
   }
   for (const w of romanHindiMarkers) {
     if (lower.includes(w)) hiScore += 1;
   }
+  for (const w of englishMarkers) {
+    if (lower.includes(w)) enScore += 1;
+  }
 
-  if (bnScore > hiScore + 1) return "bn";
-  if (hiScore > bnScore + 1) return "hi";
+  if (bnScore > hiScore && bnScore >= enScore && bnScore >= 1) return "bn";
+  if (hiScore > bnScore && hiScore >= enScore && hiScore >= 1) return "hi";
+  if (enScore >= 1 && bnScore === 0 && hiScore === 0) return "en";
 
   return preferredLanguage;
+}
+
+function normalizeLanguageParam(raw?: string): SupportedLanguage {
+  if (raw === "hi") return "hi";
+  if (raw === "en") return "en";
+  return "bn";
 }
 
 const structuredTurnSchema: Schema = {
@@ -226,16 +260,16 @@ const structuredTurnSchema: Schema = {
     transcript: {
       type: Type.STRING,
       description:
-        "Exact words spoken by the user written in Bengali script (বাংলা) if spoken in Bengali, or Devanagari script (हिन्दी) if spoken in Hindi. Empty string if heardSpeech is false.",
+        "Exact words spoken by the user written in Bengali script (বাংলা) if spoken in Bengali, Devanagari script (हिन्दी) if spoken in Hindi, or English Latin script if spoken in English. Empty string if heardSpeech is false.",
     },
     language: {
       type: Type.STRING,
-      description: "Must be 'bn' if the user spoke/wrote Bengali, or 'hi' if the user spoke/wrote Hindi.",
+      description: "Must be 'bn' for Bengali, 'hi' for Hindi, or 'en' for English.",
     },
     reply: {
       type: Type.STRING,
       description:
-        "Natural, warm, concise spoken response from Janu AI in the SAME language ('bn' in বাংলা লিপি, 'hi' in देवनागरी लिपि). Keep to 1-3 short sentences so voice playback is fast and natural.",
+        "Natural, warm, concise spoken response from Janu AI in the SAME language ('bn' in বাংলা লিপি, 'hi' in देवनागरी लिपि, or 'en' in natural English). Keep to 1-3 short sentences so voice playback is fast and natural.",
     },
     actionName: {
       type: Type.STRING,
@@ -308,7 +342,12 @@ function buildSystemInstruction(
   contacts: ContactInput[],
   deviceState: DeviceStateInput
 ): string {
-  const defaultLangName = preferredLanguage === "hi" ? "Hindi (हिन्दी, code 'hi')" : "Bengali (বাংলা, code 'bn')";
+  const defaultLangName =
+    preferredLanguage === "hi"
+      ? "Hindi (हिन्दी, code 'hi')"
+      : preferredLanguage === "en"
+      ? "English (code 'en')"
+      : "Bengali (বাংলা, code 'bn')";
 
   const savedMemoriesBlock =
     memories.length > 0
@@ -332,15 +371,17 @@ function buildSystemInstruction(
       ? `${Math.round(deviceState.batteryLevel)}% (${deviceState.isCharging ? "Charging" : "On Battery"})`
       : "Unavailable in current browser";
 
-  return `You are Janu AI (জানু এআই / जानू एआई), a fast, intelligent, warm personal AI female voice assistant created by developer Poran. Whenever asked your name or identity, always introduce yourself as Janu AI (বাংলায়: জানু এআই, হিন্দিতে: जानू एआई).
+  return `You are Janu AI (জানু এআই / जानू एआई), a fast, intelligent, JARVIS-grade personal AI female voice assistant created by developer Poran. Whenever asked your name or identity, always introduce yourself as Janu AI (বাংলায়: জানু এআই, হিন্দিতে: जानू एआई, in English: Janu AI).
 
 LANGUAGE RULES (STRICT):
-1. Detect the user's spoken or typed language:
+1. Understand Bengali, Hindi, and English naturally:
    - If the user speaks/writes Bengali, set language="bn", write transcript in বাংলা লিপি, and reply ONLY in natural Bengali (বাংলা).
    - If the user speaks/writes Hindi, set language="hi", write transcript in देवनागरी लिपि, and reply ONLY in natural Hindi (हिन्दी).
+   - If the user speaks/writes English, set language="en", write transcript in English, and reply ONLY in natural English.
    - If ambiguous, use the user's default language: ${defaultLangName}.
    - Never randomly mix or switch languages.
-2. Keep replies crisp, friendly, and fast to speak aloud (1 to 2 sentences for commands/greetings; concise and clear for general questions).
+2. If the user addresses you with a wake word ("Hey Janu", "Janu", "জানু", "হেই জানু", "जानू"), respond naturally to the command or question that follows; if they ONLY said the wake word, warmly ask how you can help in 1 short sentence.
+3. Keep replies crisp, friendly, and fast to speak aloud (1 to 2 sentences for commands/greetings; concise and clear for general questions).
 
 SAVED USER MEMORIES:
 ${savedMemoriesBlock}
@@ -664,7 +705,7 @@ async function startServer() {
         return;
       }
 
-      const prefLang: SupportedLanguage = preferredLanguage === "hi" ? "hi" : "bn";
+      const prefLang: SupportedLanguage = normalizeLanguageParam(preferredLanguage);
       const ai = getGenAIClient();
       const systemInstruction = buildSystemInstruction(prefLang, memories, contacts, deviceState);
       const contents = buildConversationHistory(history);
@@ -681,9 +722,7 @@ async function startServer() {
           },
           {
             text:
-              prefLang === "hi"
-                ? "Listen carefully to the user's voice audio (likely Hindi or Bengali). Transcribe what they said and respond immediately as Janu AI in the exact language spoken."
-                : "Listen carefully to the user's voice audio (likely Bengali or Hindi). Transcribe what they said and respond immediately as Janu AI in the exact language spoken.",
+              "Listen carefully to the user's voice audio (Bengali, Hindi, or English). Transcribe what they said and respond immediately as Janu AI in the exact language spoken.",
           },
         ],
       });
@@ -714,13 +753,17 @@ async function startServer() {
         return;
       }
 
-      const activeLang =
-        parsed.language === "hi" || parsed.language === "bn"
+      const activeLang: SupportedLanguage =
+        parsed.language === "hi" || parsed.language === "bn" || parsed.language === "en"
           ? parsed.language
           : detectActiveLanguage(transcript, prefLang);
       const finalReply =
         (parsed.reply || "").trim() ||
-        (activeLang === "hi" ? "जी, बताइए मैं कैसे मदद करूँ?" : "জি, বলুন কীভাবে সাহায্য করতে পারি?");
+        (activeLang === "hi"
+          ? "जी, बताइए मैं कैसे मदद करूँ?"
+          : activeLang === "en"
+          ? "Yes, how can I help you?"
+          : "জি, বলুন কীভাবে সাহায্য করতে পারি?");
       const toolActions = convertStructuredToToolActions(parsed);
 
       const inlineAudioRequested = (req.body as { inlineFemaleTts?: boolean }).inlineFemaleTts !== false;
@@ -781,7 +824,7 @@ async function startServer() {
       }
 
       const trimmed = message.trim();
-      const prefLang: SupportedLanguage = preferredLanguage === "hi" ? "hi" : "bn";
+      const prefLang: SupportedLanguage = normalizeLanguageParam(preferredLanguage);
       const activeLanguage = detectActiveLanguage(trimmed, prefLang);
 
       const ai = getGenAIClient();
@@ -810,7 +853,9 @@ async function startServer() {
       const rawJson = (response.text || "{}").trim();
       const parsed = JSON.parse(rawJson) as StructuredTurnOutput;
       const finalLang: SupportedLanguage =
-        parsed.language === "hi" ? "hi" : parsed.language === "bn" ? "bn" : activeLanguage;
+        parsed.language === "hi" || parsed.language === "bn" || parsed.language === "en"
+          ? parsed.language
+          : activeLanguage;
       const replyText = (parsed.reply || "").trim();
 
       if (!replyText) {
@@ -870,9 +915,7 @@ async function startServer() {
       const ai = getGenAIClient();
       const cleanMime = (mimeType || "audio/webm").split(";")[0].trim() || "audio/webm";
       const langHint =
-        preferredLanguage === "hi"
-          ? "Transcribe spoken Hindi (हिन्दी) or Bengali (বাংলা) accurately in native script."
-          : "Transcribe spoken Bengali (বাংলা) or Hindi (हिन्दी) accurately in native script.";
+        "Transcribe spoken Bengali (বাংলা), Hindi (हिन्दी), or English accurately in its native script.";
 
       let transcript = "";
       try {
@@ -902,7 +945,7 @@ async function startServer() {
 
       const detectedLanguage = detectActiveLanguage(
         transcript,
-        preferredLanguage === "hi" ? "hi" : "bn"
+        normalizeLanguageParam(preferredLanguage)
       );
 
       res.status(200).json({
@@ -938,7 +981,7 @@ async function startServer() {
         return;
       }
 
-      const safeLang: SupportedLanguage = language === "hi" ? "hi" : "bn";
+      const safeLang: SupportedLanguage = normalizeLanguageParam(language);
 
       // Super Fast 100% Female MP3 Mode (~180-300ms, never male, zero quota exhaustion)
       if (mode !== "studio") {
@@ -954,22 +997,16 @@ async function startServer() {
       const geminiFemaleVoice =
         voiceName === "Zephyr" || voiceName === "PiyaSweet" ? "Zephyr" : "Kore";
 
+      const langLabel =
+        safeLang === "hi" ? "Hindi" : safeLang === "en" ? "English" : "Bengali";
       const stylePrompt =
         voiceName === "PiyaSweet"
-          ? safeLang === "hi"
-            ? "Sweet, youthful, cute anime-style Hindi young female voice"
-            : "Sweet, youthful, cute anime-style Bengali young female voice"
+          ? `Sweet, youthful, cute anime-style ${langLabel} young female voice`
           : voiceName === "PiyaCalm"
-          ? safeLang === "hi"
-            ? "Calm, gentle, soft-spoken Hindi female personal assistant voice"
-            : "Calm, gentle, soft-spoken Bengali female personal assistant voice"
+          ? `Calm, gentle, soft-spoken ${langLabel} female personal assistant voice`
           : voiceName === "Zephyr"
-          ? safeLang === "hi"
-            ? "Bright, cheerful, energetic young Hindi female voice"
-            : "Bright, cheerful, energetic young Bengali female voice"
-          : safeLang === "hi"
-          ? "Warm, sweet, natural Hindi female personal assistant voice"
-          : "Warm, sweet, natural Bengali female personal assistant voice";
+          ? `Bright, cheerful, energetic young ${langLabel} female voice`
+          : `Warm, sweet, natural ${langLabel} female personal assistant voice`;
 
       const ai = getGenAIClient();
       const studioModels = [TTS_LITE_MODEL, TTS_STUDIO_MODEL];
