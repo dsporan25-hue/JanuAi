@@ -30,6 +30,12 @@ jobs:
           java-version: "21"
           cache: "gradle"
 
+      - name: Accept Android SDK Licenses
+        run: |
+          if [ -n "$ANDROID_HOME" ] && [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          fi
+
       - name: Install Dependencies
         run: npm install
 
@@ -46,20 +52,32 @@ jobs:
 
       - name: Build Installable Debug APK
         working-directory: android
-        run: ./gradlew assembleDebug
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Build Signed Release APK (When Signing Secrets Are Configured)
-        if: ${{ secrets.PIYA_KEYSTORE_BASE64 != '' }}
         working-directory: android
         env:
+          JANU_KEYSTORE_BASE64: ${{ secrets.JANU_KEYSTORE_BASE64 }}
+          JANU_KEYSTORE_PASSWORD: ${{ secrets.JANU_KEYSTORE_PASSWORD }}
+          JANU_KEY_ALIAS: ${{ secrets.JANU_KEY_ALIAS }}
+          JANU_KEY_PASSWORD: ${{ secrets.JANU_KEY_PASSWORD }}
           PIYA_KEYSTORE_BASE64: ${{ secrets.PIYA_KEYSTORE_BASE64 }}
           PIYA_KEYSTORE_PASSWORD: ${{ secrets.PIYA_KEYSTORE_PASSWORD }}
           PIYA_KEY_ALIAS: ${{ secrets.PIYA_KEY_ALIAS }}
           PIYA_KEY_PASSWORD: ${{ secrets.PIYA_KEY_PASSWORD }}
         run: |
-          echo "$PIYA_KEYSTORE_BASE64" | base64 --decode > piya-release.jks
-          PIYA_KEYSTORE_PATH="$PWD/piya-release.jks" ./gradlew assembleRelease
-          rm -f piya-release.jks
+          KEYSTORE_B64="${JANU_KEYSTORE_BASE64:-$PIYA_KEYSTORE_BASE64}"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > janu-release.jks
+            export PIYA_KEYSTORE_PATH="$PWD/janu-release.jks"
+            export PIYA_KEYSTORE_PASSWORD="${JANU_KEYSTORE_PASSWORD:-$PIYA_KEYSTORE_PASSWORD}"
+            export PIYA_KEY_ALIAS="${JANU_KEY_ALIAS:-$PIYA_KEY_ALIAS}"
+            export PIYA_KEY_PASSWORD="${JANU_KEY_PASSWORD:-$PIYA_KEY_PASSWORD}"
+            ./gradlew assembleRelease --no-daemon --stacktrace
+            rm -f janu-release.jks
+          else
+            echo "No release keystore secret configured; skipping optional signed release APK (Debug APK already built)."
+          fi
 
       - name: Collect Generated APK Files
         run: |

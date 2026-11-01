@@ -186,7 +186,7 @@ public class PiyaDeviceControlPlugin extends Plugin {
         Integer minObj = call.getInt("minute", 0);
         int hour = hourObj != null ? hourObj : 7;
         int minute = minObj != null ? minObj : 0;
-        String label = call.getString("label", "PIYA AI Alarm");
+        String label = call.getString("label", "Janu AI Alarm");
 
         Intent intent = new Intent(AlarmClock.ACTION_SET_ALARM);
         intent.putExtra(AlarmClock.EXTRA_HOUR, hour);
