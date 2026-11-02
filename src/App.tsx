@@ -1764,34 +1764,26 @@ export default function App() {
                   </p>
                 </div>
 
-                {/* Permanent Always Active Quick Card */}
-                <div className="rounded-2xl border border-[var(--piya-border)] bg-[#060c1a] p-3.5 flex items-center justify-between gap-3">
+                {/* Gemini Live ON/OFF — UI only */}
+                <div className="rounded-2xl border border-cyan-500/30 bg-[#060c1a] p-3.5 flex items-center justify-between gap-3">
                   <div className="min-w-0">
-                    <div className="text-xs font-semibold text-white">
-                      {copy.alwaysActiveTitle}
+                    <div className="flex items-center gap-2 text-xs font-semibold text-white">
+                      <span className="h-2 w-2 rounded-full bg-cyan-400 shadow-[0_0_10px_#22d3ee]" />
+                      Gemini Live
                     </div>
                     <div className="text-[11px] text-slate-400 truncate mt-0.5">
-                      {settings.alwaysActiveVoice
-                        ? copy.alwaysActiveOnLabel
-                        : copy.alwaysActiveOffLabel}
+                      Live voice setup coming soon
                     </div>
                   </div>
                   <button
                     type="button"
                     role="switch"
-                    aria-checked={settings.alwaysActiveVoice}
-                    onClick={() => handleToggleAlwaysActive(!settings.alwaysActiveVoice)}
-                    className={`relative inline-flex h-7 w-12 shrink-0 items-center rounded-full border transition-colors ${
-                      settings.alwaysActiveVoice
-                        ? "bg-[var(--piya-accent)] border-[var(--piya-accent-bright)]"
-                        : "bg-slate-800 border-slate-700"
-                    }`}
+                    aria-checked={false}
+                    disabled
+                    title="Gemini Live will be connected later"
+                    className="relative inline-flex h-7 w-12 shrink-0 cursor-not-allowed items-center rounded-full border border-slate-700 bg-slate-800 opacity-70"
                   >
-                    <span
-                      className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform ${
-                        settings.alwaysActiveVoice ? "translate-x-6" : "translate-x-1"
-                      }`}
-                    />
+                    <span className="inline-block h-5 w-5 translate-x-1 rounded-full bg-white shadow" />
                   </button>
                 </div>
 
