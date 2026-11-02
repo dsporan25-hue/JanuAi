@@ -1,0 +1,1184 @@
+import "dotenv/config";
+import express from "express";
+import type { NextFunction, Request, Response } from "express";
+import path from "path";
+import { fileURLToPath } from "url";
+import { createServer as createViteServer } from "vite";
+import { GoogleGenAI, Type, Modality } from "@google/genai";
+import type { Content, Schema } from "@google/genai";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+type SupportedLanguage = "bn" | "hi" | "en";
+
+interface ContactInput {
+  id: string;
+  name: string;
+  phone: string;
+  label?: string;
+}
+
+interface MemoryInput {
+  id: string;
+  category: string;
+  fact: string;
+  createdAt: string;
+}
+
+interface HistoryTurn {
+  role: "user" | "assistant";
+  text: string;
+}
+
+interface DeviceStateInput {
+  batteryLevel?: number | null;
+  isCharging?: boolean | null;
+  isNativeAndroid?: boolean;
+  isDeviceAdminActive?: boolean;
+  flashlightOn?: boolean;
+}
+
+interface StructuredTurnOutput {
+  heardSpeech?: boolean;
+  transcript?: string;
+  language?: string;
+  reply?: string;
+  actionName?: string;
+  contactName?: string;
+  lastFourDigits?: string;
+  query?: string;
+  targetApp?: string;
+  appName?: string;
+  settingType?: string;
+  flashlightMode?: string;
+  alarmHour?: number;
+  alarmMinute?: number;
+  alarmLabel?: string;
+  noteTitle?: string;
+  noteContent?: string;
+  memoryCategory?: string;
+  memoryFact?: string;
+}
+
+const FAST_CONVERSATION_MODEL = "gemini-3.1-flash-lite";
+const TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
+const TTS_LITE_MODEL = "gemini-3.8-flash-lite-tts";
+const TTS_STUDIO_MODEL = "gemini-3.8-flash-tts";
+
+function splitTextForFemaleTts(text: string, maxLen = 175): string[] {
+  const clean = text.replace(/[*#_`~]/g, "").trim();
+  if (!clean) return [];
+  const sentences = clean.match(/[^।|.?!]+(?:[।|.?!]+|$)/g) || [clean];
+  const chunks: string[] = [];
+  let current = "";
+
+  for (const raw of sentences) {
+    const s = raw.trim();
+    if (!s) continue;
+    if ((current + " " + s).trim().length <= maxLen) {
+      current = (current + " " + s).trim();
+    } else {
+      if (current) chunks.push(current);
+      if (s.length <= maxLen) {
+        current = s;
+      } else {
+        const words = s.split(/\s+/);
+        let sub = "";
+        for (const w of words) {
+          if ((sub + " " + w).trim().length <= maxLen) {
+            sub = (sub + " " + w).trim();
+          } else {
+            if (sub) chunks.push(sub);
+            sub = w;
+          }
+        }
+        current = sub;
+      }
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+/**
+ * Synthesizes 100% Female Bengali (bn), Hindi (hi), or English (en) MP3 audio in ~150-300ms.
+ * Never produces a male voice.
+ */
+async function synthesizeFastFemaleMp3Base64(
+  text: string,
+  language: SupportedLanguage
+): Promise<string> {
+  const chunks = splitTextForFemaleTts(text);
+  if (chunks.length === 0) {
+    throw new Error("Empty text for speech synthesis.");
+  }
+  const tl = language === "hi" ? "hi" : language === "en" ? "en" : "bn";
+  const buffers = await Promise.all(
+    chunks.map(async (segment) => {
+      const url = `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${tl}&q=${encodeURIComponent(
+        segment
+      )}`;
+      const resp = await fetch(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0",
+        },
+      });
+      if (!resp.ok) {
+        throw new Error(`Fast female TTS failed (${resp.status})`);
+      }
+      return Buffer.from(await resp.arrayBuffer());
+    })
+  );
+  return Buffer.concat(buffers).toString("base64");
+}
+
+function getGenAIClient(apiVersion?: string): GoogleGenAI {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || apiKey === "MY_GEMINI_API_KEY" || apiKey.trim() === "") {
+    const err = new Error(
+      "GEMINI_API_KEY সেট করা নেই। অনুগ্রহ করে AI Studio-র Settings > Secrets প্যানেলে API key যাচাই করুন।"
+    );
+    (err as Error & { statusCode?: number }).statusCode = 503;
+    throw err;
+  }
+
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      ...(apiVersion ? { apiVersion } : {}),
+      headers: {
+        "User-Agent": "aistudio-build",
+      },
+      timeout: 20000,
+    },
+  });
+}
+
+/**
+ * Detects whether user input is Bengali, Hindi, or English, falling back to preferred language.
+ */
+function detectActiveLanguage(text: string, preferredLanguage: SupportedLanguage): SupportedLanguage {
+  const bengaliChars = (text.match(/[\u0980-\u09FF]/g) || []).length;
+  const devanagariChars = (text.match(/[\u0900-\u097F]/g) || []).length;
+
+  if (bengaliChars > 0 && bengaliChars >= devanagariChars) {
+    return "bn";
+  }
+  if (devanagariChars > 0 && devanagariChars > bengaliChars) {
+    return "hi";
+  }
+
+  const lower = text.toLowerCase();
+  const romanBengaliMarkers = [
+    "kemon",
+    "acho",
+    "korbo",
+    "koro",
+    "amar",
+    "tumi",
+    "bhalo",
+    "khobor",
+    "kholo",
+    "chalao",
+    "baja",
+    "dako",
+    "mone rakho",
+    "hyan",
+  ];
+  const romanHindiMarkers = [
+    "kaise",
+    "kya",
+    "mera",
+    "meri",
+    "tum",
+    "aap",
+    "chalao",
+    "bajao",
+    "lagao",
+    "yaad rakho",
+    "haan",
+    "nahi",
+  ];
+  const englishMarkers = [
+    "what",
+    "how",
+    "who",
+    "where",
+    "when",
+    "why",
+    "please",
+    "turn on",
+    "turn off",
+    "open",
+    "call",
+    "battery",
+    "flashlight",
+    "alarm",
+    "remember",
+    "hello",
+    "good morning",
+    "good evening",
+    "tell me",
+    "play",
+    "lock",
+  ];
+
+  let bnScore = 0;
+  let hiScore = 0;
+  let enScore = 0;
+  for (const w of romanBengaliMarkers) {
+    if (lower.includes(w)) bnScore += 1;
+  }
+  for (const w of romanHindiMarkers) {
+    if (lower.includes(w)) hiScore += 1;
+  }
+  for (const w of englishMarkers) {
+    if (lower.includes(w)) enScore += 1;
+  }
+
+  if (bnScore > hiScore && bnScore >= enScore && bnScore >= 1) return "bn";
+  if (hiScore > bnScore && hiScore >= enScore && hiScore >= 1) return "hi";
+  if (enScore >= 1 && bnScore === 0 && hiScore === 0) return "en";
+
+  return preferredLanguage;
+}
+
+function normalizeLanguageParam(raw?: string): SupportedLanguage {
+  if (raw === "hi") return "hi";
+  if (raw === "en") return "en";
+  return "bn";
+}
+
+const structuredTurnSchema: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    heardSpeech: {
+      type: Type.BOOLEAN,
+      description:
+        "For audio input: true if clear human words were spoken, false ONLY if the audio is pure silence or static with no speech. For text input: always true.",
+    },
+    transcript: {
+      type: Type.STRING,
+      description:
+        "Exact words spoken by the user written in Bengali script (বাংলা) if spoken in Bengali, Devanagari script (हिन्दी) if spoken in Hindi, or English Latin script if spoken in English. Empty string if heardSpeech is false.",
+    },
+    language: {
+      type: Type.STRING,
+      description: "Must be 'bn' for Bengali, 'hi' for Hindi, or 'en' for English.",
+    },
+    reply: {
+      type: Type.STRING,
+      description:
+        "Natural, warm, concise spoken response from Janu AI in the SAME language ('bn' in বাংলা লিপি, 'hi' in देवनागरी लिपि, or 'en' in natural English). Keep to 1-3 short sentences so voice playback is fast and natural.",
+    },
+    actionName: {
+      type: Type.STRING,
+      description:
+        "Must be one of: 'none', 'proposePhoneCall', 'searchYouTube', 'openApplication', 'lockPhoneScreen', 'openSystemSettings', 'controlFlashlight', 'checkBatteryStatus', 'setDeviceAlarm', 'createPersonalNote', 'proposeMemorySave'.",
+    },
+    contactName: {
+      type: Type.STRING,
+      description: "Contact name to call when actionName is 'proposePhoneCall' (match saved contacts list if possible).",
+    },
+    lastFourDigits: {
+      type: Type.STRING,
+      description: "Optional last 4 digits of phone number when disambiguating contacts.",
+    },
+    query: {
+      type: Type.STRING,
+      description: "Song or video search query when actionName is 'searchYouTube'.",
+    },
+    targetApp: {
+      type: Type.STRING,
+      description: "'youtube' or 'youtube_music' when actionName is 'searchYouTube'.",
+    },
+    appName: {
+      type: Type.STRING,
+      description: "Application name when actionName is 'openApplication' (e.g. YouTube, WhatsApp, Spotify, Chrome, Google Maps, Gmail, Instagram).",
+    },
+    settingType: {
+      type: Type.STRING,
+      description: "One of 'wifi', 'bluetooth', 'phone_settings', 'device_admin' when actionName is 'openSystemSettings'.",
+    },
+    flashlightMode: {
+      type: Type.STRING,
+      description: "One of 'on', 'off', 'toggle' when actionName is 'controlFlashlight'.",
+    },
+    alarmHour: {
+      type: Type.INTEGER,
+      description: "Hour in 24-hour format (0-23) when actionName is 'setDeviceAlarm'.",
+    },
+    alarmMinute: {
+      type: Type.INTEGER,
+      description: "Minute (0-59) when actionName is 'setDeviceAlarm'.",
+    },
+    alarmLabel: {
+      type: Type.STRING,
+      description: "Alarm label when actionName is 'setDeviceAlarm'.",
+    },
+    noteTitle: {
+      type: Type.STRING,
+      description: "Short note title when actionName is 'createPersonalNote'.",
+    },
+    noteContent: {
+      type: Type.STRING,
+      description: "Note content when actionName is 'createPersonalNote'.",
+    },
+    memoryCategory: {
+      type: Type.STRING,
+      description: "Category ('Preference', 'Profile', 'Music', 'Routine') when actionName is 'proposeMemorySave'.",
+    },
+    memoryFact: {
+      type: Type.STRING,
+      description: "Concise user fact/preference to save when actionName is 'proposeMemorySave'.",
+    },
+  },
+  required: ["heardSpeech", "transcript", "language", "reply", "actionName"],
+};
+
+function buildSystemInstruction(
+  preferredLanguage: SupportedLanguage,
+  memories: MemoryInput[],
+  contacts: ContactInput[],
+  deviceState: DeviceStateInput
+): string {
+  const defaultLangName =
+    preferredLanguage === "hi"
+      ? "Hindi (हिन्दी, code 'hi')"
+      : preferredLanguage === "en"
+      ? "English (code 'en')"
+      : "Bengali (বাংলা, code 'bn')";
+
+  const savedMemoriesBlock =
+    memories.length > 0
+      ? memories.slice(0, 20).map((m) => `- [${m.category}] ${m.fact}`).join("\n")
+      : "None saved yet. Never claim to remember unsaved facts.";
+
+  const contactsBlock =
+    contacts.length > 0
+      ? contacts
+          .slice(0, 40)
+          .map((c) => {
+            const digits = c.phone.replace(/\D/g, "");
+            const last4 = digits.slice(-4);
+            return `- Name: "${c.name}" | Last4: ${last4} | Label: ${c.label || "Saved"}`;
+          })
+          .join("\n")
+      : "No saved contacts.";
+
+  const batterySummary =
+    typeof deviceState.batteryLevel === "number"
+      ? `${Math.round(deviceState.batteryLevel)}% (${deviceState.isCharging ? "Charging" : "On Battery"})`
+      : "Unavailable in current browser";
+
+  return `You are Janu AI (জানু এআই / जानू एआई), a fast, intelligent, JARVIS-grade personal AI female voice assistant created by developer Poran. Whenever asked your name or identity, always introduce yourself as Janu AI (বাংলায়: জানু এআই, হিন্দিতে: जानू एआई, in English: Janu AI).
+
+LANGUAGE RULES (STRICT):
+1. Understand Bengali, Hindi, and English naturally:
+   - If the user speaks/writes Bengali, set language="bn", write transcript in বাংলা লিপি, and reply ONLY in natural Bengali (বাংলা).
+   - If the user speaks/writes Hindi, set language="hi", write transcript in देवनागरी लिपि, and reply ONLY in natural Hindi (हिन्दी).
+   - If the user speaks/writes English, set language="en", write transcript in English, and reply ONLY in natural English.
+   - If ambiguous, use the user's default language: ${defaultLangName}.
+   - Never randomly mix or switch languages.
+2. If the user addresses you with a wake word ("Hey Janu", "Janu", "জানু", "হেই জানু", "जानू"), respond naturally to the command or question that follows; if they ONLY said the wake word, warmly ask how you can help in 1 short sentence.
+3. Keep replies crisp, friendly, and fast to speak aloud (1 to 2 sentences for commands/greetings; concise and clear for general questions).
+
+SAVED USER MEMORIES:
+${savedMemoriesBlock}
+
+SAVED CONTACTS:
+${contactsBlock}
+
+DEVICE STATE:
+- Runtime: ${deviceState.isNativeAndroid ? "Android APK" : "Mobile/Web Browser"}
+- Battery: ${batterySummary}
+- Flashlight: ${deviceState.flashlightOn ? "On" : "Off"}
+
+PHONE CONTROL ACTIONS:
+- Set actionName to the matching action whenever the user asks to:
+  * Call someone -> 'proposePhoneCall' (set contactName to the closest matching name from SAVED CONTACTS, e.g. if user says "পরাণকে কল করো" set contactName="Poran"; if user gives 4 digits set lastFourDigits)
+  * Play/search songs or videos on YouTube or YouTube Music -> 'searchYouTube' (set query and targetApp='youtube' or 'youtube_music')
+  * Open an app -> 'openApplication' (set appName)
+  * Lock phone screen -> 'lockPhoneScreen'
+  * Open Wi-Fi / Bluetooth / Phone / Device Admin settings -> 'openSystemSettings' (set settingType)
+  * Turn flashlight on/off -> 'controlFlashlight' (set flashlightMode)
+  * Check battery -> 'checkBatteryStatus' (include current battery % in reply if available)
+  * Set alarm -> 'setDeviceAlarm' (set alarmHour 0-23, alarmMinute 0-59, alarmLabel)
+  * Write/save a note -> 'createPersonalNote' (set noteTitle, noteContent)
+  * Remember a personal preference/fact -> 'proposeMemorySave' (set memoryCategory, memoryFact)
+  * Normal conversation or Q&A -> 'none'
+- For confirmable actions (calls, opening apps/YouTube, locking screen, alarms), politely state what you are preparing and ask confirmation in the user's language.`;
+}
+
+function convertStructuredToToolActions(parsed: StructuredTurnOutput): Array<{
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+}> {
+  const act = (parsed.actionName || "none").trim();
+  if (!act || act === "none") return [];
+
+  const id = `act_${Date.now()}`;
+  switch (act) {
+    case "proposePhoneCall":
+      return [
+        {
+          id,
+          name: "proposePhoneCall",
+          args: {
+            contactName: parsed.contactName || "",
+            lastFourDigits: parsed.lastFourDigits || "",
+          },
+        },
+      ];
+    case "searchYouTube":
+      return [
+        {
+          id,
+          name: "searchYouTube",
+          args: {
+            query: parsed.query || parsed.transcript || "",
+            targetApp: parsed.targetApp === "youtube_music" ? "youtube_music" : "youtube",
+          },
+        },
+      ];
+    case "openApplication":
+      return [
+        {
+          id,
+          name: "openApplication",
+          args: {
+            appName: parsed.appName || "YouTube",
+          },
+        },
+      ];
+    case "lockPhoneScreen":
+      return [{ id, name: "lockPhoneScreen", args: {} }];
+    case "openSystemSettings":
+      return [
+        {
+          id,
+          name: "openSystemSettings",
+          args: {
+            settingType: parsed.settingType || "phone_settings",
+          },
+        },
+      ];
+    case "controlFlashlight":
+      return [
+        {
+          id,
+          name: "controlFlashlight",
+          args: {
+            mode: parsed.flashlightMode || "toggle",
+          },
+        },
+      ];
+    case "checkBatteryStatus":
+      return [{ id, name: "checkBatteryStatus", args: { includeDetails: true } }];
+    case "setDeviceAlarm":
+      return [
+        {
+          id,
+          name: "setDeviceAlarm",
+          args: {
+            hour: typeof parsed.alarmHour === "number" && parsed.alarmHour >= 0 ? parsed.alarmHour : 7,
+            minute:
+              typeof parsed.alarmMinute === "number" && parsed.alarmMinute >= 0
+                ? parsed.alarmMinute
+                : 0,
+            label: parsed.alarmLabel || "Janu AI Alarm",
+          },
+        },
+      ];
+    case "createPersonalNote":
+      return [
+        {
+          id,
+          name: "createPersonalNote",
+          args: {
+            title: parsed.noteTitle || "Note",
+            content: parsed.noteContent || parsed.transcript || "",
+          },
+        },
+      ];
+    case "proposeMemorySave":
+      return [
+        {
+          id,
+          name: "proposeMemorySave",
+          args: {
+            category: parsed.memoryCategory || "Preference",
+            fact: parsed.memoryFact || parsed.transcript || "",
+          },
+        },
+      ];
+    default:
+      return [];
+  }
+}
+
+function buildConversationHistory(history: HistoryTurn[]): Content[] {
+  const recent = Array.isArray(history) ? history.slice(-8) : [];
+  return recent
+    .filter((turn) => turn && typeof turn.text === "string" && turn.text.trim().length > 0)
+    .map((turn) => ({
+      role: turn.role === "assistant" ? "model" : "user",
+      parts: [{ text: turn.text.trim() }],
+    }));
+}
+
+function extractTranscribeText(response: unknown): string {
+  const r = response as {
+    text?: string;
+    candidates?: Array<{
+      content?: {
+        parts?: Array<{
+          text?: string;
+          audioTranscription?: { text?: string };
+        }>;
+      };
+    }>;
+  };
+  if (typeof r.text === "string" && r.text.trim()) {
+    return r.text.trim();
+  }
+  const parts = r.candidates?.[0]?.content?.parts || [];
+  const collected: string[] = [];
+  for (const p of parts) {
+    if (p.audioTranscription?.text) collected.push(p.audioTranscription.text);
+    else if (p.text) collected.push(p.text);
+  }
+  return collected.join(" ").trim();
+}
+
+function formatGeminiError(error: unknown): { status: number; message: string; code: string } {
+  const raw = error instanceof Error ? error.message : String(error);
+  const explicitStatus =
+    (error as { statusCode?: number; status?: number })?.statusCode ||
+    (error as { status?: number })?.status;
+
+  if (raw.includes("GEMINI_API_KEY") || explicitStatus === 503) {
+    return {
+      status: 503,
+      code: "API_KEY_MISSING",
+      message:
+        "সার্ভারে Gemini API key পাওয়া যায়নি। অনুগ্রহ করে Settings > Secrets প্যানেল যাচাই করুন।",
+    };
+  }
+  if (
+    raw.includes("API_KEY_INVALID") ||
+    raw.includes("PERMISSION_DENIED") ||
+    explicitStatus === 403
+  ) {
+    return {
+      status: 403,
+      code: "API_KEY_INVALID",
+      message: "Gemini API key সঠিক নয় (403)। Settings > Secrets প্যানেল চেক করুন।",
+    };
+  }
+  if (raw.includes("RESOURCE_EXHAUSTED") || raw.includes("429") || explicitStatus === 429) {
+    return {
+      status: 429,
+      code: "QUOTA_EXCEEDED",
+      message: "Gemini API কোটা পূর্ণ হয়েছে (429)। কিছুক্ষণ পর আবার চেষ্টা করুন।",
+    };
+  }
+  if (raw.includes("DEADLINE_EXCEEDED") || raw.includes("504") || raw.includes("timeout")) {
+    return {
+      status: 504,
+      code: "TIMEOUT",
+      message: "সার্ভার থেকে উত্তর আসতে দেরি হয়েছে। অনুগ্রহ করে আবার চেষ্টা করুন।",
+    };
+  }
+  return {
+    status: 500,
+    code: "GEMINI_BACKEND_ERROR",
+    message: "এআই সার্ভিসে সাময়িক সমস্যা হয়েছে। অনুগ্রহ করে আবার চেষ্টা করুন।",
+  };
+}
+
+async function startServer() {
+  const app = express();
+  const PORT = Number(process.env.PORT) || 3000;
+
+  // Allow requests from Capacitor Android APK WebView as well as browser origin
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    if (req.method === "OPTIONS") {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
+  app.use(express.json({ limit: "15mb" }));
+
+  // 1. Health & AI Connection Status Endpoint
+  app.get("/api/status", async (req: Request, res: Response) => {
+    const hasKey = Boolean(
+      process.env.GEMINI_API_KEY &&
+        process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY" &&
+        process.env.GEMINI_API_KEY.trim().length > 0
+    );
+
+    const verifyLive = req.query.verify === "true";
+    if (!hasKey) {
+      res.status(200).json({
+        online: true,
+        aiConfigured: false,
+        aiVerified: false,
+        model: FAST_CONVERSATION_MODEL,
+        ttsModel: TTS_LITE_MODEL,
+        sttModel: TRANSCRIBE_MODEL,
+        message: "Backend online, but GEMINI_API_KEY is not set in Settings > Secrets.",
+      });
+      return;
+    }
+
+    if (!verifyLive) {
+      res.status(200).json({
+        online: true,
+        aiConfigured: true,
+        aiVerified: true,
+        model: FAST_CONVERSATION_MODEL,
+        ttsModel: TTS_LITE_MODEL,
+        sttModel: TRANSCRIBE_MODEL,
+        message: "Janu AI Fast Gemini Engine Connected",
+      });
+      return;
+    }
+
+    try {
+      const ai = getGenAIClient();
+      const ping = await ai.models.generateContent({
+        model: FAST_CONVERSATION_MODEL,
+        contents: "OK",
+      });
+      res.status(200).json({
+        online: true,
+        aiConfigured: true,
+        aiVerified: Boolean(ping.text),
+        model: FAST_CONVERSATION_MODEL,
+        ttsModel: TTS_LITE_MODEL,
+        sttModel: TRANSCRIBE_MODEL,
+        message: "Live Gemini connection verified.",
+      });
+    } catch (error) {
+      const formatted = formatGeminiError(error);
+      res.status(200).json({
+        online: true,
+        aiConfigured: hasKey,
+        aiVerified: false,
+        model: FAST_CONVERSATION_MODEL,
+        errorCode: formatted.code,
+        message: formatted.message,
+      });
+    }
+  });
+
+  // Gemini Live ephemeral token endpoint (server-side API key only)
+const liveTokenRateLimits = new Map<string, { count: number; resetAt: number }>();
+
+app.post("/api/live/token", async (req: Request, res: Response) => {
+  const now = Date.now();
+  const clientIp = req.ip || req.socket.remoteAddress || "unknown";
+  let bucket = liveTokenRateLimits.get(clientIp);
+
+  if (!bucket || bucket.resetAt <= now) {
+    bucket = { count: 0, resetAt: now + 60_000 };
+    liveTokenRateLimits.set(clientIp, bucket);
+  }
+
+  if (bucket.count >= 8) {
+    res.setHeader("Retry-After", String(Math.ceil((bucket.resetAt - now) / 1000)));
+    res.status(429).json({ error: "Too many Live token requests. Please try again shortly." });
+    return;
+  }
+  bucket.count += 1;
+
+  if (liveTokenRateLimits.size > 1000) {
+    for (const [ip, entry] of liveTokenRateLimits) {
+      if (entry.resetAt <= now) liveTokenRateLimits.delete(ip);
+    }
+  }
+
+  try {
+    const ai = getGenAIClient("v1alpha");
+    const created = await ai.authTokens.create({
+      config: {
+        uses: 1,
+        expireTime: new Date(now + 30 * 60 * 1000).toISOString(),
+        newSessionExpireTime: new Date(now + 60 * 1000).toISOString(),
+        liveConnectConstraints: {
+          model: "gemini-3.8-live",
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: "Kore" }
+              }
+            },
+            sessionResumption: {},
+            systemInstruction:
+              "You are JanuAi, a warm, helpful voice assistant. Naturally detect whether the user is speaking Bengali, Hindi, or English and reply in the same language. Keep your spoken replies clear and conversational. Let the user interrupt you naturally; stop your response when the user starts speaking."
+          }
+        },
+        lockAdditionalFields: []
+      }
+    });
+
+    if (!created.name) {
+      throw new Error("Gemini did not return an ephemeral token.");
+    }
+
+    res.status(200).json({
+      token: created.name,
+      expireTime: created.expireTime,
+      newSessionExpireTime: created.newSessionExpireTime,
+      model: "gemini-3.8-live"
+    });
+  } catch (error) {
+    console.error(
+      "Gemini Live token creation failed:",
+      error instanceof Error ? error.message : "Unknown error"
+    );
+    res.status(502).json({
+      error: "Gemini Live token could not be created. Check the backend API configuration."
+    });
+  }
+});
+
+// 2. Ultra-Fast Single-Pass Multimodal Voice Turn (Audio -> Transcript + Reply + Phone Action in ~1.3s)
+  app.post("/api/assistant/voice-turn", async (req: Request, res: Response) => {
+    try {
+      const {
+        audioBase64,
+        mimeType = "audio/webm",
+        preferredLanguage = "bn",
+        history = [],
+        memories = [],
+        contacts = [],
+        deviceState = {},
+      } = req.body as {
+        audioBase64?: string;
+        mimeType?: string;
+        preferredLanguage?: SupportedLanguage;
+        history?: HistoryTurn[];
+        memories?: MemoryInput[];
+        contacts?: ContactInput[];
+        deviceState?: DeviceStateInput;
+      };
+
+      if (!audioBase64 || typeof audioBase64 !== "string") {
+        res.status(400).json({ error: "ভয়েস অডিও পাওয়া যায়নি।", code: "INVALID_AUDIO" });
+        return;
+      }
+
+      const prefLang: SupportedLanguage = normalizeLanguageParam(preferredLanguage);
+      const ai = getGenAIClient();
+      const systemInstruction = buildSystemInstruction(prefLang, memories, contacts, deviceState);
+      const contents = buildConversationHistory(history);
+
+      const cleanMime = (mimeType || "audio/webm").split(";")[0].trim() || "audio/webm";
+      contents.push({
+        role: "user",
+        parts: [
+          {
+            inlineData: {
+              mimeType: cleanMime,
+              data: audioBase64,
+            },
+          },
+          {
+            text:
+              "Listen carefully to the user's voice audio (Bengali, Hindi, or English). Transcribe what they said and respond immediately as Janu AI in the exact language spoken.",
+          },
+        ],
+      });
+
+      const response = await ai.models.generateContent({
+        model: FAST_CONVERSATION_MODEL,
+        contents,
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: structuredTurnSchema,
+        },
+      });
+
+      const rawJson = (response.text || "{}").trim();
+      const parsed = JSON.parse(rawJson) as StructuredTurnOutput;
+      const transcript = (parsed.transcript || "").trim();
+
+      if (parsed.heardSpeech === false || !transcript) {
+        res.status(200).json({
+          heardSpeech: false,
+          transcript: "",
+          reply: "",
+          language: prefLang,
+          toolActions: [],
+          sources: [],
+        });
+        return;
+      }
+
+      const activeLang: SupportedLanguage =
+        parsed.language === "hi" || parsed.language === "bn" || parsed.language === "en"
+          ? parsed.language
+          : detectActiveLanguage(transcript, prefLang);
+      const finalReply =
+        (parsed.reply || "").trim() ||
+        (activeLang === "hi"
+          ? "जी, बताइए मैं कैसे मदद करूँ?"
+          : activeLang === "en"
+          ? "Yes, how can I help you?"
+          : "জি, বলুন কীভাবে সাহায্য করতে পারি?");
+      const toolActions = convertStructuredToToolActions(parsed);
+
+      const inlineAudioRequested = (req.body as { inlineFemaleTts?: boolean }).inlineFemaleTts !== false;
+      let ttsAudioBase64: string | undefined;
+      let audioMimeType: string | undefined;
+
+      // Pre-synthesize female voice inline (~200ms) unless client will override spoken text for contact lookup
+      if (inlineAudioRequested && parsed.actionName !== "proposePhoneCall") {
+        try {
+          ttsAudioBase64 = await synthesizeFastFemaleMp3Base64(finalReply, activeLang);
+          audioMimeType = "audio/mpeg";
+        } catch {
+          // Client will fetch /api/assistant/tts as fallback if needed
+        }
+      }
+
+      res.status(200).json({
+        heardSpeech: true,
+        transcript,
+        reply: finalReply,
+        language: activeLang,
+        toolActions,
+        sources: [],
+        audioBase64: ttsAudioBase64,
+        audioMimeType,
+      });
+    } catch (error) {
+      const formatted = formatGeminiError(error);
+      res.status(formatted.status).json({
+        error: formatted.message,
+        code: formatted.code,
+      });
+    }
+  });
+
+  // 3. Ultra-Fast Single-Pass Text Conversational Endpoint (~0.9s)
+  app.post("/api/assistant/chat", async (req: Request, res: Response) => {
+    try {
+      const {
+        message,
+        preferredLanguage = "bn",
+        history = [],
+        memories = [],
+        contacts = [],
+        deviceState = {},
+      } = req.body as {
+        message?: string;
+        preferredLanguage?: SupportedLanguage;
+        history?: HistoryTurn[];
+        memories?: MemoryInput[];
+        contacts?: ContactInput[];
+        deviceState?: DeviceStateInput;
+      };
+
+      if (!message || typeof message !== "string" || !message.trim()) {
+        res.status(400).json({ error: "মেসেজ খালি রাখা যাবে না।", code: "INVALID_INPUT" });
+        return;
+      }
+
+      const trimmed = message.trim();
+      const prefLang: SupportedLanguage = normalizeLanguageParam(preferredLanguage);
+      const activeLanguage = detectActiveLanguage(trimmed, prefLang);
+
+      const ai = getGenAIClient();
+      const systemInstruction = buildSystemInstruction(
+        activeLanguage,
+        memories,
+        contacts,
+        deviceState
+      );
+      const contents = buildConversationHistory(history);
+      contents.push({
+        role: "user",
+        parts: [{ text: trimmed }],
+      });
+
+      const response = await ai.models.generateContent({
+        model: FAST_CONVERSATION_MODEL,
+        contents,
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: structuredTurnSchema,
+        },
+      });
+
+      const rawJson = (response.text || "{}").trim();
+      const parsed = JSON.parse(rawJson) as StructuredTurnOutput;
+      const finalLang: SupportedLanguage =
+        parsed.language === "hi" || parsed.language === "bn" || parsed.language === "en"
+          ? parsed.language
+          : activeLanguage;
+      const replyText = (parsed.reply || "").trim();
+
+      if (!replyText) {
+        throw new Error("Empty reply from Gemini.");
+      }
+
+      const toolActions = convertStructuredToToolActions(parsed);
+
+      const inlineAudioRequested = (req.body as { inlineFemaleTts?: boolean }).inlineFemaleTts !== false;
+      let audioBase64: string | undefined;
+      let audioMimeType: string | undefined;
+
+      if (inlineAudioRequested && parsed.actionName !== "proposePhoneCall") {
+        try {
+          audioBase64 = await synthesizeFastFemaleMp3Base64(replyText, finalLang);
+          audioMimeType = "audio/mpeg";
+        } catch {
+          // Client fallback
+        }
+      }
+
+      res.status(200).json({
+        reply: replyText,
+        language: finalLang,
+        toolActions,
+        sources: [],
+        audioBase64,
+        audioMimeType,
+      });
+    } catch (error) {
+      const formatted = formatGeminiError(error);
+      res.status(formatted.status).json({
+        error: formatted.message,
+        code: formatted.code,
+      });
+    }
+  });
+
+  // 4. Standalone Speech-to-Text Transcription (extracts audioTranscription.text properly)
+  app.post("/api/assistant/transcribe", async (req: Request, res: Response) => {
+    try {
+      const {
+        audioBase64,
+        mimeType = "audio/webm",
+        preferredLanguage = "bn",
+      } = req.body as {
+        audioBase64?: string;
+        mimeType?: string;
+        preferredLanguage?: SupportedLanguage;
+      };
+
+      if (!audioBase64 || typeof audioBase64 !== "string") {
+        res.status(400).json({ error: "Audio payload is missing.", code: "INVALID_AUDIO" });
+        return;
+      }
+
+      const ai = getGenAIClient();
+      const cleanMime = (mimeType || "audio/webm").split(";")[0].trim() || "audio/webm";
+      const langHint =
+        "Transcribe spoken Bengali (বাংলা), Hindi (हिन्दी), or English accurately in its native script.";
+
+      let transcript = "";
+      try {
+        const response = await ai.models.generateContent({
+          model: TRANSCRIBE_MODEL,
+          contents: {
+            parts: [
+              { inlineData: { mimeType: cleanMime, data: audioBase64 } },
+              { text: langHint },
+            ],
+          },
+        });
+        transcript = extractTranscribeText(response);
+      } catch {
+        // Fallback to fast multimodal flash-lite transcription
+        const fallback = await ai.models.generateContent({
+          model: FAST_CONVERSATION_MODEL,
+          contents: {
+            parts: [
+              { inlineData: { mimeType: cleanMime, data: audioBase64 } },
+              { text: `${langHint} Return ONLY the spoken words, or empty string if silent.` },
+            ],
+          },
+        });
+        transcript = (fallback.text || "").trim();
+      }
+
+      const detectedLanguage = detectActiveLanguage(
+        transcript,
+        normalizeLanguageParam(preferredLanguage)
+      );
+
+      res.status(200).json({
+        transcript,
+        detectedLanguage,
+      });
+    } catch (error) {
+      const formatted = formatGeminiError(error);
+      res.status(formatted.status).json({
+        error: formatted.message,
+        code: formatted.code,
+      });
+    }
+  });
+
+  // 5. 100% Female-Only Text-to-Speech Endpoint (Fast Female MP3 + Studio Gemini Female Voices)
+  app.post("/api/assistant/tts", async (req: Request, res: Response) => {
+    try {
+      const {
+        text,
+        voiceName = "Kore",
+        language = "bn",
+        mode = "fast",
+      } = req.body as {
+        text?: string;
+        voiceName?: string;
+        language?: SupportedLanguage;
+        mode?: "fast" | "studio";
+      };
+
+      if (!text || typeof text !== "string" || !text.trim()) {
+        res.status(400).json({ error: "Text is required for TTS.", code: "INVALID_TEXT" });
+        return;
+      }
+
+      const safeLang: SupportedLanguage = normalizeLanguageParam(language);
+
+      // Super Fast 100% Female MP3 Mode (~180-300ms, never male, zero quota exhaustion)
+      if (mode !== "studio") {
+        const mp3Base64 = await synthesizeFastFemaleMp3Base64(text.trim(), safeLang);
+        res.status(200).json({
+          audioBase64: mp3Base64,
+          mimeType: "audio/mpeg",
+        });
+        return;
+      }
+
+      // Studio Neural Mode: strictly FEMALE prebuilt voices ONLY ('Kore' or 'Zephyr' — male voices banned)
+      const geminiFemaleVoice =
+        voiceName === "Zephyr" || voiceName === "PiyaSweet" ? "Zephyr" : "Kore";
+
+      const langLabel =
+        safeLang === "hi" ? "Hindi" : safeLang === "en" ? "English" : "Bengali";
+      const stylePrompt =
+        voiceName === "PiyaSweet"
+          ? `Sweet, youthful, cute anime-style ${langLabel} young female voice`
+          : voiceName === "PiyaCalm"
+          ? `Calm, gentle, soft-spoken ${langLabel} female personal assistant voice`
+          : voiceName === "Zephyr"
+          ? `Bright, cheerful, energetic young ${langLabel} female voice`
+          : `Warm, sweet, natural ${langLabel} female personal assistant voice`;
+
+      const ai = getGenAIClient();
+      const studioModels = [TTS_LITE_MODEL, TTS_STUDIO_MODEL];
+
+      for (const ttsModel of studioModels) {
+        try {
+          const response = await ai.models.generateContent({
+            model: ttsModel,
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text: text.trim(),
+                    speechMetadata: {
+                      style: stylePrompt,
+                    },
+                  },
+                ],
+              },
+            ],
+            config: {
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: {
+                    voiceName: geminiFemaleVoice,
+                  },
+                },
+              },
+            },
+          });
+
+          const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+          if (base64Audio) {
+            res.status(200).json({
+              audioBase64: base64Audio,
+              mimeType: "audio/wav",
+            });
+            return;
+          }
+        } catch {
+          // Try next studio female model or fall back to fast female MP3 below
+        }
+      }
+
+      // Seamless fallback to Fast 100% Female MP3 if Studio quota (429) is reached — NEVER male!
+      const fallbackMp3 = await synthesizeFastFemaleMp3Base64(text.trim(), safeLang);
+      res.status(200).json({
+        audioBase64: fallbackMp3,
+        mimeType: "audio/mpeg",
+      });
+    } catch (error) {
+      const formatted = formatGeminiError(error);
+      res.status(formatted.status).json({
+        error: formatted.message,
+        code: formatted.code,
+      });
+    }
+  });
+
+  // Never allow any /api/* route to fall through to HTML index.html
+  app.all("/api/*", (req: Request, res: Response) => {
+    res.status(404).json({
+      error: `API endpoint not found: ${req.method} ${req.originalUrl}`,
+      code: "API_NOT_FOUND",
+    });
+  });
+
+  // Express JSON error guard for malformed body / payload size errors
+  app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+    if (req.path.startsWith("/api/")) {
+      res.status(400).json({
+        error: err.message || "Invalid API request payload.",
+        code: "BAD_REQUEST",
+      });
+      return;
+    }
+    next(err);
+  });
+
+  // Vite Dev Server or Production Static Assets
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(__dirname, "dist");
+    app.use(express.static(distPath));
+    app.get("*", (_req: Request, res: Response) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Janu AI server running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer();

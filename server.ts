@@ -4,7 +4,7 @@ import type { NextFunction, Request, Response } from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI, Type, Modality } from "@google/genai";
 import type { Content, Schema } from "@google/genai";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -133,7 +133,7 @@ async function synthesizeFastFemaleMp3Base64(
   return Buffer.concat(buffers).toString("base64");
 }
 
-function getGenAIClient(): GoogleGenAI {
+function getGenAIClient(apiVersion?: string): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || apiKey === "MY_GEMINI_API_KEY" || apiKey.trim() === "") {
     const err = new Error(
@@ -146,6 +146,7 @@ function getGenAIClient(): GoogleGenAI {
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
+      ...(apiVersion ? { apiVersion } : {}),
       headers: {
         "User-Agent": "aistudio-build",
       },
@@ -679,7 +680,92 @@ async function startServer() {
     }
   });
 
-  // 2. Ultra-Fast Single-Pass Multimodal Voice Turn (Audio -> Transcript + Reply + Phone Action in ~1.3s)
+  // Gemini Live ephemeral token endpoint (per-user BYOK)
+const liveTokenRateLimits = new Map<string, { count: number; resetAt: number }>();
+
+app.post("/api/live/token", async (req: Request, res: Response) => {
+  const now = Date.now();
+  const clientIp = req.ip || req.socket.remoteAddress || "unknown";
+  let bucket = liveTokenRateLimits.get(clientIp);
+
+  if (!bucket || bucket.resetAt <= now) {
+    bucket = { count: 0, resetAt: now + 60_000 };
+    liveTokenRateLimits.set(clientIp, bucket);
+  }
+
+  if (bucket.count >= 8) {
+    res.setHeader("Retry-After", String(Math.ceil((bucket.resetAt - now) / 1000)));
+    res.status(429).json({ error: "Too many Live token requests. Please try again shortly." });
+    return;
+  }
+  bucket.count += 1;
+
+  if (liveTokenRateLimits.size > 1000) {
+    for (const [ip, entry] of liveTokenRateLimits) {
+      if (entry.resetAt <= now) liveTokenRateLimits.delete(ip);
+    }
+  }
+
+  const userApiKey =
+    typeof req.body?.apiKey === "string" ? req.body.apiKey.trim() : "";
+
+  if (!userApiKey || userApiKey.length > 512) {
+    res.status(400).json({ error: "Please add your Gemini API Key in JanuAi Settings." });
+    return;
+  }
+
+  try {
+    const ai = new GoogleGenAI({
+      apiKey: userApiKey,
+      httpOptions: {
+        apiVersion: "v1alpha",
+        headers: { "User-Agent": "aistudio-build" },
+        timeout: 20000,
+      },
+    });
+
+    const created = await ai.authTokens.create({
+      config: {
+        uses: 1,
+        expireTime: new Date(now + 30 * 60 * 1000).toISOString(),
+        newSessionExpireTime: new Date(now + 60 * 1000).toISOString(),
+        liveConnectConstraints: {
+          model: "gemini-3.8-live",
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: "Kore" }
+              }
+            },
+            sessionResumption: {},
+            systemInstruction:
+              "You are JanuAi, a warm, helpful voice assistant. Naturally detect whether the user is speaking Bengali, Hindi, or English and reply in the same language. Keep your spoken replies clear and conversational. Let the user interrupt you naturally; stop your response when the user starts speaking."
+          }
+        },
+        lockAdditionalFields: []
+      }
+    });
+
+    if (!created.name) {
+      throw new Error("Gemini did not return an ephemeral token.");
+    }
+
+    res.status(200).json({
+      token: created.name,
+      expireTime: created.expireTime,
+      newSessionExpireTime: created.newSessionExpireTime,
+      model: "gemini-3.8-live"
+    });
+  } catch {
+    console.error("Gemini Live token creation failed.");
+    res.status(502).json({
+      error: "Gemini Live token could not be created. Check your Gemini API Key and Live model access."
+    });
+  }
+});
+
+// 2. Ultra-Fast Single-Pass Multimodal Voice Turn (Audio -> Transcript + Reply + Phone Action in ~1.3s)
   app.post("/api/assistant/voice-turn", async (req: Request, res: Response) => {
     try {
       const {
